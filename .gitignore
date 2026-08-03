@@ -1,0 +1,45 @@
+# ===============================
+# Python
+# ===============================
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# ===============================
+# Jupyter
+# ===============================
+.ipynb_checkpoints/
+
+# ===============================
+# OS / Editor junk
+# ===============================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ===============================
+# Deep RL artifacts
+# ===============================
+runs/
+logs/
+checkpoints/
+*.pt
+*.pth
+*.pkl
+wandb/
+tensorboard/
+
+# ===============================
+# Local-only docs
+# ===============================
+docs/implementation_standards.md

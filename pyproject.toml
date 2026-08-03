@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-reinforcement-learning"
+version = "0.1.0"
+description = "From-scratch PyTorch implementations of deep reinforcement learning algorithms"
+requires-python = ">=3.12"
+
+dependencies = [
+    "torch",
+    # The [torch] extra brings array_api_compat, which gymnasium.wrappers
+    # NumpyToTorch imports lazily -- without it the wrapper raises a bare
+    # ModuleNotFoundError. See docs/implementation_standards.md, section 2.
+    "gymnasium[torch]",
+    "matplotlib",
+    "pyyaml",  # experiment configs (section 11)
+    "tqdm",
+]
+
+# numpy and scipy are deliberately absent: this package never imports numpy
+# (section 1), and the bootstrap CI removed the only use scipy had (section 9).
+# numpy still arrives transitively via gymnasium and matplotlib.
+
+[project.optional-dependencies]
+# runs/<run_name>/metrics.jsonl is the source of truth for everything reported
+# (section 11). TensorBoard is a viewer for watching long runs live; it costs
+# grpcio + protobuf + werkzeug, so it is opt-in until step 6.
+tb = ["tensorboard"]
+box2d = ["gymnasium[box2d]"]    # LunarLander, BipedalWalker -- step 7, needs system swig
+mujoco = ["gymnasium[mujoco]"]  # HalfCheetah, Hopper, Reacher -- step 9
+
+[dependency-groups]
+dev = ["pytest", "ipykernel"]
+
+# CPU-only torch until DQN-on-Atari (section 13). Nothing through PPO benefits
+# from CUDA, and the default wheel bundles it at ~2.5-3 GB. Delete both blocks
+# below to switch to the CUDA build, then `uv lock --upgrade-package torch`.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
