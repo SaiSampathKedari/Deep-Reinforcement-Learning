@@ -43,3 +43,8 @@ tensorboard/
 # Local-only docs
 # ===============================
 docs/implementation_standards.md
+
+# ===============================
+# Reference repos, read-only (clone with: git clone --depth 1 <url> external/<name>)
+# ===============================
+external/

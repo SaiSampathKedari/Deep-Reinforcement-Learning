@@ -28,11 +28,18 @@ dependencies = [
 # (section 11). TensorBoard is a viewer for watching long runs live; it costs
 # grpcio + protobuf + werkzeug, so it is opt-in until step 6.
 tb = ["tensorboard"]
+# classic-control brings pygame-ce (rendering); other brings moviepy (mp4 writing).
+video = ["gymnasium[classic-control,other]"]
 box2d = ["gymnasium[box2d]"]    # LunarLander, BipedalWalker -- step 7, needs system swig
 mujoco = ["gymnasium[mujoco]"]  # HalfCheetah, Hopper, Reacher -- step 9
 
 [dependency-groups]
 dev = ["pytest", "ipykernel"]
+
+# Without this, `pytest` from the repo root also tries to collect the reference
+# repos cloned into external/ (cleanrl, spinningup, sb3, AgileRL).
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 # CPU-only torch until DQN-on-Atari (section 13). Nothing through PPO benefits
 # from CUDA, and the default wheel bundles it at ~2.5-3 GB. Delete both blocks
