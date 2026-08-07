@@ -4,9 +4,10 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from gymnasium.vector import VectorEnv
 from torch.distributions import Distribution
 from dataclasses import dataclass
+
+from gymnasium.vector import AutoresetMode, VectorEnv
 
 from deeprl.logger import Logger, MetricHistory
 from deeprl.utils import grad_norm
@@ -17,14 +18,14 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class OneStepACConfig:
-    total_timesteps :   int   = 500_000
-    gamma           :   float = 0.99
-    seed            :   int   = 0
-    device          :   str   = "cpu"
-    log_every       :   int   = 1000
-    lr_actor        :   float = 1e-3
-    lr_critic       :   float = 1e-2
-    discount_actor  :   bool  = True
+    total_timesteps :   int          = 500_000
+    gamma           :   float        = 0.99
+    seed            :   int          = 0
+    device          :   torch.device = torch.device("cpu")
+    log_every       :   int          = 1000
+    lr_actor        :   float        = 1e-3
+    lr_critic       :   float        = 1e-2
+    discount_actor  :   bool         = True
 
 
 def one_step_actor_critic(
@@ -34,7 +35,18 @@ def one_step_actor_critic(
     cfg             :   OneStepACConfig,
     writer          :   SummaryWriter | None = None,
 ) -> MetricHistory:
-
+    
+    
+    # The Whole algorithm rests on this: under DISABLED every returned row is a
+    # genuine transition and next_obs is the true final observation, so there is
+    # no filler step to mask. Gymnasium's defalut is NEXT_STEP, which would both
+    # feed a fabricated transistion into the update and double--reset.
+    assert envs.metadata.get("autoreset_mode") is AutoresetMode.DISABLED, (
+        "this algorithm assumes AutoresetMode.DISABLED: it resets finished "
+        f"sub-environments itself via reset_mask. Got {envs.metadata.get("autoreset_mode")}."
+    )
+    
+    
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------

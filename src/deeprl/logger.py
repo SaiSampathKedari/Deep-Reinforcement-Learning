@@ -84,7 +84,7 @@ class Logger:
         num_envs: int,
         log_every: int = 1000,
         writer: SummaryWriter | None = None,
-        device: str | torch.device = "cpu",
+        device: torch.device = torch.device("cpu"),
         ev_window: int = 2000,
         ev_name: str = "diagnostics/explained_variance",
     ) -> None:
