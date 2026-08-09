@@ -10,9 +10,11 @@ from dataclasses import dataclass
 from gymnasium.vector import AutoresetMode, VectorEnv
 
 from deeprl.logger import Logger, MetricHistory
+from deeprl.stats import TrainingStats
 from deeprl.utils import grad_norm
 
 if TYPE_CHECKING:
+    from deeprl.evaluate import Evaluator
     from torch.utils.tensorboard import SummaryWriter
 
 
@@ -34,9 +36,11 @@ def one_step_actor_critic(
     value_fn        :   nn.Module,
     cfg             :   OneStepACConfig,
     writer          :   SummaryWriter | None = None,
+    logger          :   Logger | None = None,
+    evaluator       :   Evaluator | None = None,
 ) -> MetricHistory:
-    
-    
+
+
     # The Whole algorithm rests on this: under DISABLED every returned row is a
     # genuine transition and next_obs is the true final observation, so there is
     # no filler step to mask. Gymnasium's defalut is NEXT_STEP, which would both
@@ -45,8 +49,8 @@ def one_step_actor_critic(
         "this algorithm assumes AutoresetMode.DISABLED: it resets finished "
         f"sub-environments itself via reset_mask. Got {envs.metadata.get("autoreset_mode")}."
     )
-    
-    
+
+
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
@@ -55,13 +59,15 @@ def one_step_actor_critic(
     # interval averaging and the optional TensorBoard mirror.
     # ev_name: this algorithm's critic regresses on a one-step TD target, not
     # on empirical returns, so the two must not share a metric key.
-    logger = Logger(
-        envs.num_envs,
-        cfg.log_every,
-        writer,
-        cfg.device,
-        ev_name="diagnostics/td_target_explained_variance",
-    )
+    owns_logger = logger is None
+    if logger is None:
+        logger = Logger(
+            envs.num_envs,
+            cfg.log_every,
+            writer,
+            cfg.device,
+            ev_name="diagnostics/td_target_explained_variance",
+        )
     logger.log_hyperparameters(cfg)
 
     policy   = policy.to(device=cfg.device)
@@ -182,10 +188,8 @@ def one_step_actor_critic(
         # 5. Metrics
         # --------------------------------------------------------------
 
-        # One call per vector step. The logger advances the global step,
-        # accumulates per-environment episode return and length, emits
-        # charts/episodic_* for episodes that just finished, and averages
-        # these diagnostics over cfg.log_every before emitting them.
+        # Collection, learner statistics and reporting are separate operations.
+        # This makes each emitted point describe complete updates only.
         #
         # values and td_targets feed a rolling window from which explained
         # variance is computed: over a single vector step there are only N
@@ -193,17 +197,29 @@ def one_step_actor_critic(
         logger.log_step(
             rewards,
             dones,
-            metrics={
-                "losses/actor_loss"              : actor_loss,
-                "losses/critic_loss"             : critic_loss,
-                "diagnostics/entropy"            : entropy,
-                "diagnostics/mean_abs_td_error"  : td_errors.detach().abs().mean(),
-                "grads/actor_norm"               : actor_grad_norm,
-                "grads/critic_norm"              : critic_grad_norm,
-            },
             values=values,
             targets=td_targets,
         )
+        logger.log_update(
+            TrainingStats(
+                metrics={
+                    "losses/policy_loss": actor_loss.detach().item(),
+                    "losses/value_loss": critic_loss.detach().item(),
+                    "diagnostics/entropy": entropy.detach().item(),
+                    "diagnostics/mean_abs_td_error": (
+                        td_errors.detach().abs().mean().item()
+                    ),
+                    "grads/policy_norm": actor_grad_norm,
+                    "grads/value_norm": critic_grad_norm,
+                    "charts/policy_learning_rate": optim_actor.param_groups[0]["lr"],
+                    "charts/value_learning_rate": optim_critic.param_groups[0]["lr"],
+                },
+                gradient_steps=1,
+            )
+        )
+        logger.maybe_dump()
+        if evaluator is not None:
+            evaluator.maybe_evaluate(policy, logger)
 
         # --------------------------------------------------------------
         # 6. Update discounts
@@ -235,5 +251,8 @@ def one_step_actor_critic(
             # from the observation returned by envs.step()
             obs = next_obs
 
+    if evaluator is not None:
+        evaluator.evaluate_now(policy, logger)
+
     # Flushes the final partial logging interval before returning.
-    return logger.finish()
+    return logger.finish() if owns_logger else logger.history

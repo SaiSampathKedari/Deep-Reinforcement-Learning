@@ -48,3 +48,10 @@ docs/implementation_standards.md
 # Reference repos, read-only (clone with: git clone --depth 1 <url> external/<name>)
 # ===============================
 external/
+
+# ===============================
+# Local-only, not committed yet
+# ===============================
+src/deeprl/train.py
+tests/
+notebooks/
