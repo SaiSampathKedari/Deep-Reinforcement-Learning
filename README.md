@@ -5,8 +5,7 @@ implementations: rigorous proofs, step-by-step derivations of objectives and
 gradient estimators, correctness-focused actor-critic code, and reproducible
 experiment infrastructure for Gymnasium.
 
-> [!IMPORTANT]
-> **This repository is under active development.** New mathematical
+> ⚠️ **This repository is under active development.** New mathematical
 > derivations, algorithms, tests, experiment configurations, and benchmark
 > studies will be added throughout the coming weeks.
 
@@ -29,17 +28,17 @@ cross-seed aggregation.
 Each algorithm is developed from its objective and gradient estimator before
 being translated into PyTorch. For example, GAE is implemented directly from
 
-$$
+```math
 \delta_t = R_{t+1}
 + \gamma(1-\mathrm{termination}_t)V(S_{t+1}) - V(S_t),
-$$
+```
 
-$$
+```math
 \hat A_t = \delta_t
 + \gamma\lambda(1-\mathrm{done}_t)\hat A_{t+1},
 \qquad
 V_t^{\mathrm{target}} = V(S_t) + \hat A_t.
-$$
+```
 
 [`rollouts.py`](src/deeprl/rollouts.py) preserves the true next observation,
 [`advantages.py`](src/deeprl/advantages.py) constructs fixed advantages and
