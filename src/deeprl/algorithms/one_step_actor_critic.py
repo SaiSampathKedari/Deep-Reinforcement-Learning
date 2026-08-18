@@ -1,21 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from torch.distributions import Distribution
-from dataclasses import dataclass
-
 from gymnasium.vector import AutoresetMode, VectorEnv
+from torch.distributions import Distribution
 
 from deeprl.logger import Logger, MetricHistory
 from deeprl.stats import TrainingStats
 from deeprl.utils import grad_norm
 
 if TYPE_CHECKING:
-    from deeprl.evaluate import Evaluator
     from torch.utils.tensorboard import SummaryWriter
+
+    from deeprl.evaluate import Evaluator
 
 
 @dataclass(frozen=True)

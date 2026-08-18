@@ -7,9 +7,8 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from torch.distributions import Distribution
-
 from gymnasium.vector import VectorEnv
+from torch.distributions import Distribution
 
 from deeprl.algorithms.on_policy import (
     OnPolicyConfig,
@@ -22,8 +21,9 @@ from deeprl.stats import TrainingStats
 from deeprl.utils import explained_variance
 
 if TYPE_CHECKING:
-    from deeprl.evaluate import Evaluator
     from torch.utils.tensorboard import SummaryWriter
+
+    from deeprl.evaluate import Evaluator
 
 
 @dataclass(frozen=True)
@@ -87,6 +87,13 @@ class A2CLearner(OnPolicyLearner):
         num_samples = 0
         gradient_steps = 0
 
+        # Normalize once over the complete rollout so the update uses one fixed
+        # set of advantage weights, matching the other on-policy learners.
+        if self.cfg.normalize_advantage and advantages.numel() > 1:
+            advantages = (
+                advantages - advantages.mean()
+            ) / (advantages.std(unbiased=False) + 1e-8)
+
         for batch in buffer.get(
             advantages=advantages,
             value_targets=value_targets,
@@ -124,13 +131,6 @@ class A2CLearner(OnPolicyLearner):
             # Advantages were computed without gradients and therefore remain
             # fixed weights in the policy-gradient objective.
             batch_advantages = batch.advantages
-
-            # Optional normalization changes the scale, but not the ordering, of
-            # advantages within this batch.
-            if self.cfg.normalize_advantage and batch_advantages.numel() > 1:
-                batch_advantages = (
-                    batch_advantages - batch_advantages.mean()
-                ) / (batch_advantages.std(unbiased=False) + 1e-8)
 
             # entropy = mean[H(pi(.|S))]
             # policy_loss = -mean[advantage * log pi(A|S)] - ent_coef * entropy

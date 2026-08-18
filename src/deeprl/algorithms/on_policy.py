@@ -16,10 +16,10 @@ from deeprl.logger import Logger, MetricHistory
 from deeprl.rollouts import collect_rollout, evaluate_next_values
 from deeprl.stats import TrainingStats
 
-
 if TYPE_CHECKING:
-    from deeprl.evaluate import Evaluator
     from torch.utils.tensorboard import SummaryWriter
+
+    from deeprl.evaluate import Evaluator
 
 
 @dataclass(frozen=True)

@@ -9,22 +9,23 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from torch.distributions import Distribution, kl_divergence
 from gymnasium.vector import VectorEnv
+from torch.distributions import Distribution, kl_divergence
 
 from deeprl.algorithms.on_policy import (
     OnPolicyConfig,
     OnPolicyLearner,
     train_on_policy,
 )
-from deeprl.buffers import RolloutBuffer, RolloutBatch
+from deeprl.buffers import RolloutBatch, RolloutBuffer
 from deeprl.logger import Logger, MetricHistory
 from deeprl.stats import TrainingStats
 from deeprl.utils import explained_variance
 
 if TYPE_CHECKING:
-    from deeprl.evaluate import Evaluator
     from torch.utils.tensorboard import SummaryWriter
+
+    from deeprl.evaluate import Evaluator
 
 
 def _flat_grad(

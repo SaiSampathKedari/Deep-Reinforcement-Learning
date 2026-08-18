@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from torch.distributions import Distribution
 from gymnasium.vector import VectorEnv
+from torch.distributions import Distribution
 
 from deeprl.algorithms.npg import (
     NPGConfig,
@@ -19,10 +19,10 @@ from deeprl.algorithms.on_policy import train_on_policy
 from deeprl.buffers import RolloutBatch
 from deeprl.logger import Logger, MetricHistory
 
-
 if TYPE_CHECKING:
-    from deeprl.evaluate import Evaluator
     from torch.utils.tensorboard import SummaryWriter
+
+    from deeprl.evaluate import Evaluator
 
 
 @dataclass(frozen=True)
