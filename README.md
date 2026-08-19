@@ -151,12 +151,14 @@ The detailed dependency order and deployment criteria are documented in the
 
 ## Related Repositories
 
-- [Real Analysis](https://github.com/SaiSampathKedari/Real-Analysis)
-- [Probability and Distribution Theory](https://github.com/SaiSampathKedari/Probability-and-Distribution-Theory)
-- [Statistical Inference Theory](https://github.com/SaiSampathKedari/Statistical-Inference-Theory)
-- [Sequential Decision Making](https://github.com/SaiSampathKedari/Sequential-Decision-Making)
-- [Reinforcement Learning](https://github.com/SaiSampathKedari/Reinforcement-Learning)
+A sequence from mathematical foundations to deep reinforcement learning:
+
+- **Foundations:** [Real Analysis](https://github.com/SaiSampathKedari/Real-Analysis) · [Probability & Distribution Theory](https://github.com/SaiSampathKedari/Probability-and-Distribution-Theory) · [Statistical Inference Theory](https://github.com/SaiSampathKedari/Statistical-Inference-Theory)
+- **Sequential-decision theory:** [Sequential Decision Making](https://github.com/SaiSampathKedari/Sequential-Decision-Making)
+- **Classical reinforcement learning:** [Reinforcement Learning](https://github.com/SaiSampathKedari/Reinforcement-Learning)
+- **Deep reinforcement learning:** [Deep Reinforcement Learning](https://github.com/SaiSampathKedari/Deep-Reinforcement-Learning)
 
 ## Contact
 
-[Email](mailto:sampath@umich.edu) | [LinkedIn](https://www.linkedin.com/in/sai-sampath-kedari)
+- Email: [sampath@umich.edu](mailto:sampath@umich.edu)
+- LinkedIn: [sai-sampath-kedari](https://www.linkedin.com/in/sai-sampath-kedari)
