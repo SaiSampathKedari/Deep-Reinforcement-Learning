@@ -1,89 +1,121 @@
 # Deep Reinforcement Learning
 
-Deep Reinforcement Learning from mathematical foundations to PyTorch
-implementations: rigorous proofs, step-by-step derivations of objectives and
-gradient estimators, correctness-focused actor-critic code, and reproducible
-experiment infrastructure for Gymnasium.
+**Mathematical derivations, proofs, and correctness-focused PyTorch implementations of deep reinforcement learning algorithms.**
 
-> ⚠️ **This repository is under active development.** New mathematical
-> derivations, algorithms, tests, experiment configurations, and benchmark
-> studies will be added throughout the coming weeks.
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Gymnasium](https://img.shields.io/badge/Gymnasium-0081A5)](https://gymnasium.farama.org/)
+[![Development](https://img.shields.io/badge/status-active_development-F4B942)](#roadmap)
 
-## Current Algorithms
+This repository develops each algorithm from its mathematical objective to its
+tensor implementation. The emphasis is on understanding every estimator,
+preserving the semantics of the underlying Markov decision process, and building
+components that can be reused across increasingly capable RL algorithms.
 
-| Algorithm | Core mechanism | Status |
-|---|---|:---:|
-| One-step actor-critic | TD(0) policy and value updates | Implemented |
-| A2C with GAE | Synchronous rollouts and TD(lambda) targets | Implemented |
-| Natural Policy Gradient | Matrix-free Fisher-vector products and conjugate gradient | Implemented |
-| Trust Region Policy Optimization | KL-constrained natural-gradient steps with backtracking | Implemented |
-| Proximal Policy Optimization | Clipped surrogate optimization with shuffled minibatches | Next |
+> **Active development:** the on-policy foundation is implemented. Continuous
+> control, off-policy learning, offline RL, and robotics experiments are the next
+> major stages.
 
-The current code includes vectorized rollout storage, explicit termination and
-truncation handling, a shared on-policy training engine, matrix-free natural
-gradient updates, TRPO backtracking, structured logging, scheduled policy
-evaluation, and cross-seed aggregation.
+## Implemented
 
-## From Mathematics to Code
+- **[One-step actor-critic](src/deeprl/algorithms/one_step_actor_critic.py):** TD(0) policy and value updates.
+- **[A2C](src/deeprl/algorithms/a2c.py):** synchronous vector rollouts with generalized advantage estimation.
+- **[Natural Policy Gradient](src/deeprl/algorithms/npg.py):** matrix-free Fisher-vector products and conjugate gradient.
+- **[TRPO](src/deeprl/algorithms/trpo.py):** natural-gradient proposals with a KL-constrained backtracking line search.
+- **[PPO-Clip](src/deeprl/algorithms/ppo.py):** clipped surrogate optimization over shuffled minibatches and multiple epochs.
 
-Each algorithm is developed from its objective and gradient estimator before
-being translated into PyTorch. GAE is implemented directly from
+These algorithms share one [on-policy training engine](src/deeprl/algorithms/on_policy.py),
+while each learner owns its optimization rule.
 
-```math
-\delta_t = R_{t+1}
-+ \gamma(1-\mathrm{termination}_t)V(S_{t+1}) - V(S_t),
-\qquad
-\hat A_t = \delta_t
-+ \gamma\lambda(1-\mathrm{done}_t)\hat A_{t+1},
-\qquad
-V_t^{\mathrm{target}} = V(S_t) + \hat A_t.
+## From Mathematics To Code
+
+The repository follows one path throughout:
+
+```text
+objective and derivation
+        |
+        v
+rollout data and episode-boundary semantics
+        |
+        v
+fixed advantages and value targets
+        |
+        v
+algorithm-specific optimization
+        |
+        v
+evaluation and reproducible metrics
 ```
 
-[`rollouts.py`](src/deeprl/rollouts.py) preserves the true next observation,
-[`advantages.py`](src/deeprl/advantages.py) constructs fixed advantages and
-value targets, and [`a2c.py`](src/deeprl/algorithms/a2c.py) performs the policy
-and value-function updates.
+For the current on-policy algorithms, that path is implemented by:
 
-NPG and TRPO use the damped natural-gradient system without materializing the
-Fisher information matrix:
-
-```math
-(F + \eta I)x = g,
-\qquad
-\Delta\theta =
-\sqrt{\frac{2\delta}{x^\top(F + \eta I)x}}\,x.
+```text
+collect_rollout
+    -> evaluate_next_values
+    -> generalized_advantage_estimate
+    -> learner.update
 ```
 
-[`npg.py`](src/deeprl/algorithms/npg.py) computes Fisher-vector products and
-solves this system with conjugate gradient. [`trpo.py`](src/deeprl/algorithms/trpo.py)
-reuses the NPG step and adds a backtracking line search for surrogate improvement
-and the sampled KL constraint.
+The GAE implementation keeps termination and truncation distinct:
+
+```text
+delta_t        = reward_t + gamma * (1 - terminated_t) * V(next_state_t) - V(state_t)
+advantage_t    = delta_t + gamma * lambda * (1 - done_t) * advantage_(t+1)
+value_target_t = V(state_t) + advantage_t
+```
+
+See [rollout collection](src/deeprl/rollouts.py),
+[advantage estimation](src/deeprl/advantages.py), and the
+[rollout buffer](src/deeprl/buffers.py) for the corresponding tensor operations.
+NPG and TRPO solve the damped natural-gradient system through
+Fisher-vector products, so the full Fisher matrix is never materialized.
 
 ## Mathematical Reports
 
-Self-contained derivations and their corresponding PyTorch implementations.
+The reports are part of the implementation, not supplementary notes.
 
-| Mathematical development | Reports | Implementation |
-|---|---|---|
-| Policy-gradient foundations | [Preliminaries](reports/13_Policy-Gradient-Preliminaries.pdf) · [Policy Gradient Theorem](reports/10_Policy-Gradient-Theorem.pdf) · [Trajectory Proof](reports/12_Policy-Gradient-Theorem_Episodic-Trajectory-Route.pdf) · [Average-Reward Theorem](reports/11_Average-Reward-Policy-Gradient-Theorem.pdf) | Used throughout the policy-gradient algorithms |
-| REINFORCE | [REINFORCE](reports/14_REINFORCE.pdf) | Report only |
-| Actor-critic and baselines | [Actor-Critic](reports/15_Actor-Critic.pdf) · [Baselines and Advantages](reports/16_Actor-Critic-with-a-Baseline.pdf) | [`one_step_actor_critic.py`](src/deeprl/algorithms/one_step_actor_critic.py) |
-| GAE and A2C | [Generalized Advantage Estimation](reports/17_GAE_Actor-Critic.pdf) | [`advantages.py`](src/deeprl/advantages.py) · [`a2c.py`](src/deeprl/algorithms/a2c.py) |
-| Natural Policy Gradient | [Natural Policy Gradient](reports/18_Natural-Policy-Gradient.pdf) | [`npg.py`](src/deeprl/algorithms/npg.py) |
-| Trust Region Policy Optimization | [TRPO](reports/19_Trust-Region-Policy-Optimization.pdf) | [`trpo.py`](src/deeprl/algorithms/trpo.py) |
+- **Policy-gradient foundations:** [Preliminaries](reports/13_Policy-Gradient-Preliminaries.pdf), [Policy Gradient Theorem](reports/10_Policy-Gradient-Theorem.pdf), [episodic trajectory derivation](reports/12_Policy-Gradient-Theorem_Episodic-Trajectory-Route.pdf), and [average-reward theorem](reports/11_Average-Reward-Policy-Gradient-Theorem.pdf).
+- **REINFORCE:** [derivation](reports/14_REINFORCE.pdf).
+- **Actor-critic:** [derivation](reports/15_Actor-Critic.pdf), [baselines and advantages](reports/16_Actor-Critic-with-a-Baseline.pdf), and [implementation](src/deeprl/algorithms/one_step_actor_critic.py).
+- **GAE and A2C:** [derivation](reports/17_GAE_Actor-Critic.pdf) and [implementation](src/deeprl/algorithms/a2c.py).
+- **Natural Policy Gradient:** [derivation](reports/18_Natural-Policy-Gradient.pdf) and [implementation](src/deeprl/algorithms/npg.py).
+- **TRPO:** [derivation](reports/19_Trust-Region-Policy-Optimization.pdf) and [implementation](src/deeprl/algorithms/trpo.py).
+- **PPO-Clip:** [implementation](src/deeprl/algorithms/ppo.py); mathematical report in progress.
 
-## Code Map
+## Correctness Decisions
 
-- [`on_policy.py`](src/deeprl/algorithms/on_policy.py): shared on-policy training lifecycle.
-- [`a2c.py`](src/deeprl/algorithms/a2c.py), [`npg.py`](src/deeprl/algorithms/npg.py), and [`trpo.py`](src/deeprl/algorithms/trpo.py): algorithm-specific update rules.
-- [`rollouts.py`](src/deeprl/rollouts.py), [`buffers.py`](src/deeprl/buffers.py), and [`advantages.py`](src/deeprl/advantages.py): on-policy data collection and target construction.
-- [`policies.py`](src/deeprl/policies.py) and [`value.py`](src/deeprl/value.py): policy distributions and value functions.
-- [`logger.py`](src/deeprl/logger.py) and [`evaluate.py`](src/deeprl/evaluate.py): experiment tracking, evaluation, and seed aggregation.
+- Terminated transitions do not bootstrap.
+- Truncated transitions bootstrap from the true final observation.
+- Both episode boundaries stop the recursive GAE trace.
+- Rollouts and targets are collected without retaining neural-network graphs.
+- Advantages and value targets remain fixed throughout an update phase.
+- PPO compares current log probabilities with collection-time log probabilities.
+- NPG and TRPO keep the rollout policy fixed while constructing the natural-gradient step.
 
-## Setup
+## Repository Structure
 
-Requires Python 3.12 or later and uses [uv](https://docs.astral.sh/uv/) for
-dependency management.
+```text
+reports/                    mathematical derivations and proofs
+src/deeprl/
+  advantages.py             GAE and value-target construction
+  buffers.py                on-policy rollout storage and batching
+  rollouts.py               vectorized environment collection
+  policies.py               stochastic policy modules
+  value.py                  state-value modules
+  logger.py                 training metrics and run artifacts
+  evaluate.py               policy evaluation and seed aggregation
+  algorithms/
+    on_policy.py            shared on-policy training lifecycle
+    a2c.py                  A2C learner
+    npg.py                  Natural Policy Gradient learner
+    trpo.py                 TRPO learner
+    ppo.py                  PPO-Clip learner
+```
+
+## Installation
+
+Python 3.12 or later is required. Dependencies are managed with
+[uv](https://docs.astral.sh/uv/).
 
 ```bash
 git clone https://github.com/SaiSampathKedari/Deep-Reinforcement-Learning.git
@@ -91,45 +123,40 @@ cd Deep-Reinforcement-Learning
 uv sync
 ```
 
-Optional dependencies are available for TensorBoard, video recording, Box2D,
-and MuJoCo through the `tb`, `video`, `box2d`, and `mujoco` extras.
+Optional dependency groups are available for TensorBoard, video recording,
+Box2D, and MuJoCo.
 
 ## Roadmap
 
-The phases are ordered by implementation dependencies and relevance to
-continuous control and robotics.
+Development proceeds along two connected tracks.
 
-| Phase | Area | Implementation order |
-|:---:|---|---|
-| 1 | On-policy completion | PPO → continuous-action PPO |
-| 2 | Off-policy foundations | Replay buffer and target networks → DQN → Double DQN |
-| 3 | Continuous off-policy actor-critic | DDPG → TD3 → SAC |
-| 4 | Offline RL | TD3+BC → AWAC → IQL → CQL |
-| 5 | Model-based RL | Neural dynamics → random shooting → CEM-MPC → PETS → MBPO → Dreamer-style latent world models |
-| 6 | Goal-conditioned and multi-task RL | Goal-conditioned policies → universal value functions → hindsight experience replay → goal-conditioned SAC → multi-task policies |
-| 7 | Exploration | Count and pseudo-count bonuses → curiosity and intrinsic motivation → random network distillation → ensemble uncertainty |
-| 8 | Hierarchical and skill-based RL | Options → Option-Critic → skill-conditioned policies → DIAYN → subgoal and manager-worker methods |
-| 9 | Robustness, safety, and sim-to-real | Domain and dynamics randomization → constrained policy optimization → residual RL → robust policy optimization → sim-to-real adaptation |
-| 10 | Advanced value-based RL | Dueling DQN → prioritized experience replay → n-step DQN → C51 → QR-DQN → Rainbow |
-| 11 | Recurrent and distributed RL | Recurrent PPO → IMPALA and V-trace → distributed replay → D4PG → R2D2 |
-| 12 | Advanced robotics research | Meta-RL → RL with sequence models → reward and preference learning → multi-agent RL → VLA policies |
+**Deep RL algorithms**
 
-Evaluation will progress from Gymnasium correctness environments to MuJoCo
-continuous-control tasks and OGBench offline and robotic-control benchmarks.
+1. Continuous-action policies and Gymnasium/MuJoCo validation.
+2. Replay buffers, target networks, DQN, and Double DQN.
+3. DDPG, TD3, and SAC for continuous control.
+4. TD3+BC, AWAC, IQL, and CQL for offline RL.
+5. Model-based, goal-conditioned, and advanced value-based methods.
 
-New algorithms will be accompanied by their mathematical development,
-implementation, correctness tests, and multi-seed experiments.
+**Robotic manipulation**
+
+1. Reproduce the official OpenArm MuJoCo and ACT pipelines.
+2. Build behavioral-cloning baselines with visual and temporal observations.
+3. Add ACT and diffusion-policy training for bimanual action sequences.
+4. Add interactive imitation learning and offline-to-online improvement.
+5. Validate deployment, latency, safety, and sim-to-real transfer on OpenArm.
+
+The detailed dependency order and deployment criteria are documented in the
+[OpenArm manipulation roadmap](docs/openarm_manipulation_roadmap.md).
 
 ## Related Repositories
 
-A sequence from mathematical foundations to deep reinforcement learning:
-
-- **Foundations:** [Real Analysis](https://github.com/SaiSampathKedari/Real-Analysis) · [Probability & Distribution Theory](https://github.com/SaiSampathKedari/Probability-and-Distribution-Theory) · [Statistical Inference Theory](https://github.com/SaiSampathKedari/Statistical-Inference-Theory)
-- **Sequential-decision theory:** [Sequential Decision Making](https://github.com/SaiSampathKedari/Sequential-Decision-Making)
-- **Classical reinforcement learning:** [Reinforcement Learning](https://github.com/SaiSampathKedari/Reinforcement-Learning)
-- **Deep reinforcement learning:** [Deep Reinforcement Learning](https://github.com/SaiSampathKedari/Deep-Reinforcement-Learning)
+- [Real Analysis](https://github.com/SaiSampathKedari/Real-Analysis)
+- [Probability and Distribution Theory](https://github.com/SaiSampathKedari/Probability-and-Distribution-Theory)
+- [Statistical Inference Theory](https://github.com/SaiSampathKedari/Statistical-Inference-Theory)
+- [Sequential Decision Making](https://github.com/SaiSampathKedari/Sequential-Decision-Making)
+- [Reinforcement Learning](https://github.com/SaiSampathKedari/Reinforcement-Learning)
 
 ## Contact
 
-- Email: [sampath@umich.edu](mailto:sampath@umich.edu)
-- LinkedIn: [sai-sampath-kedari](https://www.linkedin.com/in/sai-sampath-kedari)
+[Email](mailto:sampath@umich.edu) | [LinkedIn](https://www.linkedin.com/in/sai-sampath-kedari)
