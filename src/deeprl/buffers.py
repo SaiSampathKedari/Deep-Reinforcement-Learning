@@ -1,12 +1,12 @@
-"""Time-major rollout storage and flat batches for on-policy updates."""
+"""On-policy rollout storage and off-policy replay storage."""
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import NamedTuple
 
-import torch
 import gymnasium as gym
+import torch
 
 
 class RolloutBatch(NamedTuple):
@@ -70,9 +70,9 @@ class RolloutBuffer:
         self.observations       = torch.zeros((T, N, *observation_shape), dtype=observation_dtype, device=self.device )
         self.actions            = torch.zeros((T, N, *action_shape), dtype=action_dtype, device=self.device)
         self.rewards            = torch.zeros(T, N, dtype=torch.float32, device=self.device)
+        self.next_observations  = torch.zeros((T, N, *observation_shape), dtype=observation_dtype, device=self.device)
         self.terminations       = torch.zeros(T, N, dtype=torch.bool, device=self.device)
         self.truncations        = torch.zeros(T, N, dtype=torch.bool, device=self.device)
-        self.next_observations  = torch.zeros((T, N, *observation_shape), dtype=observation_dtype, device=self.device)
         self.values             = torch.zeros(T, N, dtype=torch.float32, device=self.device)
         self.log_probs          = torch.zeros(T, N, dtype=torch.float32, device=self.device)
 
@@ -213,3 +213,234 @@ class RolloutBuffer:
                 advantages=advantages[batch_indices],
                 value_targets=value_targets[batch_indices],
             )
+
+
+class ReplayBatch(NamedTuple):
+    """One flat batch consumed by an off-policy update.
+
+    B transitions are sampled independently from replay storage. Targets are
+    intentionally absent because each algorithm computes its own Bellman target.
+    """
+
+    observations        :   torch.Tensor    # (B, *obs_shape)
+    actions             :   torch.Tensor    # (B, *action_shape)
+    rewards             :   torch.Tensor    # (B,) float32
+    next_observations   :   torch.Tensor    # (B, *obs_shape)
+    terminations        :   torch.Tensor    # (B,) bool
+    truncations         :   torch.Tensor    # (B,) bool
+
+
+class ReplayBuffer:
+    """Own fixed-capacity circular storage for off-policy transitions.
+
+    The buffer stores complete transitions and samples them uniformly. It does
+    not interact with environments, networks, or algorithm-specific targets.
+    """
+
+    def __init__(
+        self,
+        capacity            :   int,
+        observation_space   :   gym.Space,
+        action_space        :   gym.Space,
+        sample_device       :   torch.device,
+        storage_device      :   torch.device | None = None
+    ) -> None:
+        if capacity <= 0:
+            raise ValueError(f"capacity must be positive, got {capacity}")
+
+        # --------------------------------------------------------------
+        # Replay geometry and devices
+        # --------------------------------------------------------------
+
+        self.capacity = capacity
+        self.sample_device = sample_device
+
+        # Large replay storage defaults to CPU; sampled batches are transferred
+        # to sample_device immediately before an update.
+        self.storage_device = (
+            torch.device("cpu")
+            if storage_device is None
+            else storage_device
+        )
+
+        observation_dtype = _space_dtype(observation_space)
+        observation_shape = observation_space.shape
+
+        action_dtype = _space_dtype(action_space)
+        action_shape = action_space.shape
+
+        C = self.capacity
+
+        # --------------------------------------------------------------
+        # Flat transition storage
+        # --------------------------------------------------------------
+
+        # Each row stores one complete transition. C is the maximum number of
+        # transitions retained before new data begins overwriting old data.
+        self.observations = torch.zeros(
+            (C, *observation_shape),
+            dtype=observation_dtype,
+            device=self.storage_device,
+        )
+        self.actions = torch.zeros(
+            (C, *action_shape),
+            dtype=action_dtype,
+            device=self.storage_device,
+        )
+        self.rewards = torch.zeros(
+            C,
+            dtype=torch.float32,
+            device=self.storage_device,
+        )
+        self.next_observations = torch.zeros(
+            (C, *observation_shape),
+            dtype=observation_dtype,
+            device=self.storage_device,
+        )
+        self.terminations = torch.zeros(
+            C,
+            dtype=torch.bool,
+            device=self.storage_device,
+        )
+        self.truncations = torch.zeros(
+            C,
+            dtype=torch.bool,
+            device=self.storage_device,
+        )
+
+        # pos is the next write location; size is the readable population.
+        self.pos = 0
+        self.size = 0
+
+    def reset(self) -> None:
+        """Reset replay metadata without reallocating storage."""
+        self.pos = 0
+        self.size = 0
+
+    @property
+    def full(self) -> bool:
+        return self.size == self.capacity
+
+    def __len__(self) -> int:
+        """Return the number of transitions available for sampling."""
+        return self.size
+
+    @torch.no_grad()
+    def add(
+        self,
+        *,
+        observation     :   torch.Tensor,   # (M, *obs_shape)
+        action          :   torch.Tensor,   # (M, *action_shape)
+        reward          :   torch.Tensor,   # (M,) float32
+        next_observation:   torch.Tensor,   # (M, *obs_shape)
+        termination     :   torch.Tensor,   # (M,) bool
+        truncation      :   torch.Tensor,   # (M,) bool
+    ) -> None:
+        """Store M aligned transitions in circular replay storage."""
+
+        # --------------------------------------------------------------
+        # 1. Circular write locations
+        # --------------------------------------------------------------
+
+        num_transitions = observation.shape[0]
+
+        if num_transitions > self.capacity:
+            raise ValueError(
+                f"cannot add {num_transitions} transitions to a replay buffer "
+                f"with capacity {self.capacity}"
+            )
+
+        # Modulo indexing wraps a write across the end of storage.
+        indices = (
+            self.pos + torch.arange(
+                num_transitions,
+                device=self.storage_device,
+            )
+        ) % self.capacity
+
+        fields = (
+            ("observation", observation, self.observations),
+            ("action", action, self.actions),
+            ("reward", reward, self.rewards),
+            ("next_observation", next_observation, self.next_observations),
+            ("termination", termination, self.terminations),
+            ("truncation", truncation, self.truncations),
+        )
+
+        # --------------------------------------------------------------
+        # 2. Validate and copy the transition batch
+        # --------------------------------------------------------------
+
+        # Validate the complete transition batch before changing any storage.
+        for name, tensor, storage in fields:
+            expected_shape = (num_transitions, *storage.shape[1:])
+            if tensor.shape != expected_shape:
+                raise ValueError(
+                    f"{name} must have shape {expected_shape}, "
+                    f"got {tuple(tensor.shape)}"
+                )
+
+        # Copy every field with the same indices to preserve alignment.
+        for _, tensor, storage in fields:
+            storage[indices] = tensor.detach().to(
+                dtype=storage.dtype,
+                device=storage.device,
+            )
+
+        # --------------------------------------------------------------
+        # 3. Advance replay metadata
+        # --------------------------------------------------------------
+
+        self.pos = (self.pos + num_transitions) % self.capacity
+
+        self.size = min(
+            self.size + num_transitions,
+            self.capacity
+        )
+
+    def sample(
+        self,
+        batch_size  :   int,
+    ) -> ReplayBatch:
+        """Sample uniformly with replacement from the stored transitions.
+
+        The requested batch may exceed the current buffer size; in that case,
+        transitions can appear more than once in the returned batch.
+        """
+
+        if self.size == 0:
+            raise RuntimeError("cannot sample from an empty replay buffer")
+
+        # --------------------------------------------------------------
+        # 1. Uniform transition sampling
+        # --------------------------------------------------------------
+
+        # Every valid transition is in [0, size) before the first wrap. Once the
+        # buffer wraps, size equals capacity and every storage location is valid.
+        indices = torch.randint(
+            low=0,
+            high=self.size,
+            size=(batch_size,),
+            device=self.storage_device,
+        )
+
+        # --------------------------------------------------------------
+        # 2. Assemble the training batch
+        # --------------------------------------------------------------
+
+        # Gather on the storage device, then transfer only the sampled data to
+        # the learner's device.
+        return ReplayBatch(
+            observations=self.observations[indices].to(
+                device=self.sample_device
+            ),
+            actions=self.actions[indices].to(device=self.sample_device),
+            rewards=self.rewards[indices].to(device=self.sample_device),
+            next_observations=self.next_observations[indices].to(
+                device=self.sample_device
+            ),
+            terminations=self.terminations[indices].to(
+                device=self.sample_device
+            ),
+            truncations=self.truncations[indices].to(device=self.sample_device),
+        )
