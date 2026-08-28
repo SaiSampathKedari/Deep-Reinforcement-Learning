@@ -34,10 +34,10 @@ disconnected training systems.
 
 | Algorithm | What is implemented | Derivation |
 |---|---|---|
-| [One-step actor-critic](src/deeprl/algorithms/one_step_actor_critic.py) | TD(0) actor and critic updates | [Actor-Critic](reports/15_Actor-Critic.pdf), [Actor-Critic with a Baseline](reports/16_Actor-Critic-with-a-Baseline.pdf) |
-| [A2C](src/deeprl/algorithms/a2c.py) | Synchronous vector rollouts and generalized advantage estimation | [GAE Actor-Critic](reports/17_GAE_Actor-Critic.pdf) |
-| [Natural Policy Gradient](src/deeprl/algorithms/npg.py) | Matrix-free Fisher-vector products and conjugate gradient | [Natural Policy Gradient](reports/18_Natural-Policy-Gradient.pdf) |
-| [TRPO](src/deeprl/algorithms/trpo.py) | KL-constrained natural-gradient step with backtracking | [Trust Region Policy Optimization](reports/19_Trust-Region-Policy-Optimization.pdf) |
+| [One-step actor-critic](src/deeprl/algorithms/one_step_actor_critic.py) | TD(0) actor and critic updates | [Actor-Critic](mathematical_derivations/15_Actor-Critic.pdf), [Actor-Critic with a Baseline](mathematical_derivations/16_Actor-Critic-with-a-Baseline.pdf) |
+| [A2C](src/deeprl/algorithms/a2c.py) | Synchronous vector rollouts and generalized advantage estimation | [GAE Actor-Critic](mathematical_derivations/17_GAE_Actor-Critic.pdf) |
+| [Natural Policy Gradient](src/deeprl/algorithms/npg.py) | Matrix-free Fisher-vector products and conjugate gradient | [Natural Policy Gradient](mathematical_derivations/18_Natural-Policy-Gradient.pdf) |
+| [TRPO](src/deeprl/algorithms/trpo.py) | KL-constrained natural-gradient step with backtracking | [Trust Region Policy Optimization](mathematical_derivations/19_Trust-Region-Policy-Optimization.pdf) |
 | [PPO-Clip](src/deeprl/algorithms/ppo.py) | Clipped surrogate optimization over shuffled minibatches and multiple epochs | Report in progress |
 
 The algorithms share a small [on-policy training lifecycle](src/deeprl/algorithms/on_policy.py),
@@ -140,14 +140,14 @@ src/deeprl/
     ppo.py               Proximal Policy Optimization
 ```
 
-## Mathematical Notes
+## Mathematical Derivations
 
-The supporting reports include
-[policy-gradient preliminaries](reports/13_Policy-Gradient-Preliminaries.pdf),
-the [Policy Gradient Theorem](reports/10_Policy-Gradient-Theorem.pdf), an
-[episodic trajectory derivation](reports/12_Policy-Gradient-Theorem_Episodic-Trajectory-Route.pdf),
-the [average-reward theorem](reports/11_Average-Reward-Policy-Gradient-Theorem.pdf),
-and [REINFORCE](reports/14_REINFORCE.pdf). Algorithm-specific reports are linked
+The supporting derivations include
+[policy-gradient preliminaries](mathematical_derivations/13_Policy-Gradient-Preliminaries.pdf),
+the [Policy Gradient Theorem](mathematical_derivations/10_Policy-Gradient-Theorem.pdf), an
+[episodic trajectory derivation](mathematical_derivations/12_Policy-Gradient-Theorem_Episodic-Trajectory-Route.pdf),
+the [average-reward theorem](mathematical_derivations/11_Average-Reward-Policy-Gradient-Theorem.pdf),
+and [REINFORCE](mathematical_derivations/14_REINFORCE.pdf). Algorithm-specific derivations are linked
 in the table above.
 
 ## Next
