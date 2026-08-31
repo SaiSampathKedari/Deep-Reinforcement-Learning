@@ -4,49 +4,53 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![Gymnasium](https://img.shields.io/badge/Gymnasium-0081A5)](https://gymnasium.farama.org/)
 [![MuJoCo](https://img.shields.io/badge/MuJoCo-00599C)](https://mujoco.org/)
-[![Development](https://img.shields.io/badge/status-active_development-F4B942)](#direction)
+[![Development](https://img.shields.io/badge/status-active_development-F4B942)](#roadmap)
 
 This project builds a PyTorch reinforcement learning library from the
-mathematics outward. Each algorithm begins with a derivation and carries the
-same objects into code: rollout data, estimators, policy objectives, and
-parameter updates.
+mathematics outward. Each algorithm begins with a derivation, and the same
+objects then appear explicitly in code: sampled transitions, estimators,
+objectives, constraints, and parameter updates.
 
-## Direction
+The current implementation covers the on-policy path from one-step
+actor-critic through PPO. Work is now moving into off-policy learning, followed
+by offline and model-based RL, richer policy architectures, reproducible
+Gymnasium and MuJoCo benchmarks, and robotics policy training and deployment.
 
-The on-policy foundation is implemented. Development now expands across five
-connected tracks:
+> **Active development:** Algorithms, mathematical derivations, tests, and
+> benchmark configurations are being added continuously. APIs may change as
+> the shared on-policy and off-policy foundations are completed.
 
-- **RL algorithms:** off-policy, offline, and model-based reinforcement
-  learning.
-- **Imitation and policy learning:** behavior cloning, ACT, and diffusion
-  policies.
-- **Model architectures:** recurrent, visual, and transformer-based policies.
-- **Evaluation:** reproducible multi-seed benchmarks on Gymnasium and MuJoCo.
-- **Robotics:** learning from real-robot data, policy deployment, and VLA
-  post-training.
+## Algorithms and Derivations
 
-The immediate work is continuous-action policy support and reproducible
-Gymnasium/MuJoCo evaluation, followed by DQN, Double DQN, DDPG, TD3, and SAC.
-Later stages will build on those foundations rather than introducing separate,
-disconnected training systems.
-
-## Implemented
-
-| Algorithm | What is implemented | Derivation |
+| Algorithm | Implementation | Mathematics |
 |---|---|---|
-| [One-step actor-critic](src/deeprl/algorithms/one_step_actor_critic.py) | TD(0) actor and critic updates | [Actor-Critic](mathematical_derivations/15_Actor-Critic.pdf), [Actor-Critic with a Baseline](mathematical_derivations/16_Actor-Critic-with-a-Baseline.pdf) |
-| [A2C](src/deeprl/algorithms/a2c.py) | Synchronous vector rollouts and generalized advantage estimation | [GAE Actor-Critic](mathematical_derivations/17_GAE_Actor-Critic.pdf) |
-| [Natural Policy Gradient](src/deeprl/algorithms/npg.py) | Matrix-free Fisher-vector products and conjugate gradient | [Natural Policy Gradient](mathematical_derivations/18_Natural-Policy-Gradient.pdf) |
-| [TRPO](src/deeprl/algorithms/trpo.py) | KL-constrained natural-gradient step with backtracking | [Trust Region Policy Optimization](mathematical_derivations/19_Trust-Region-Policy-Optimization.pdf) |
-| [PPO-Clip](src/deeprl/algorithms/ppo.py) | Clipped surrogate optimization over shuffled minibatches and multiple epochs | Report in progress |
+| One-step actor-critic | [TD(0) actor and critic updates](src/deeprl/algorithms/one_step_actor_critic.py) | [Actor-Critic](mathematical_derivations/15_Actor-Critic.pdf), [Actor-Critic with a Baseline](mathematical_derivations/16_Actor-Critic-with-a-Baseline.pdf) |
+| A2C | [Synchronous rollouts and GAE](src/deeprl/algorithms/a2c.py) | [GAE Actor-Critic](mathematical_derivations/17_GAE_Actor-Critic.pdf) |
+| Natural Policy Gradient | [Matrix-free natural-gradient updates](src/deeprl/algorithms/npg.py) | [Natural Policy Gradient](mathematical_derivations/18_Natural-Policy-Gradient.pdf) |
+| TRPO | [KL-constrained updates with backtracking](src/deeprl/algorithms/trpo.py) | [Trust Region Policy Optimization](mathematical_derivations/19_Trust-Region-Policy-Optimization.pdf) |
+| PPO-Clip | [Multi-epoch shuffled-minibatch updates](src/deeprl/algorithms/ppo.py) | In progress |
+| DQN | In progress | [Deep Q-Network](mathematical_derivations/21_Deep-Q-Network.pdf) |
+| Deterministic Policy Gradient | Planned | [Deterministic Policy Gradient](mathematical_derivations/23_Deterministic-Policy-Gradient.pdf) |
 
-The algorithms share a small [on-policy training lifecycle](src/deeprl/algorithms/on_policy.py),
-while each learner owns its optimization rule.
+Supporting derivations cover the
+[Policy Gradient Theorem](mathematical_derivations/10_Policy-Gradient-Theorem.pdf),
+its [average-reward](mathematical_derivations/11_Average-Reward-Policy-Gradient-Theorem.pdf)
+and [episodic trajectory](mathematical_derivations/12_Policy-Gradient-Theorem_Episodic-Trajectory-Route.pdf)
+forms, [policy-gradient preliminaries](mathematical_derivations/13_Policy-Gradient-Preliminaries.pdf),
+and [REINFORCE](mathematical_derivations/14_REINFORCE.pdf).
 
-## Mathematics In The Implementation
+The on-policy learners share one
+[collection and estimation lifecycle](src/deeprl/algorithms/on_policy.py), while
+each algorithm owns its optimization rule.
 
-The estimator is not treated as a preprocessing detail. For GAE, the code
-implements two different boundary decisions:
+## From Mathematics to Code
+
+The derivations are design documents for the implementation, not separate
+explanations added afterward. They determine what the buffers preserve, where
+gradients stop, which quantities remain fixed during an update, and which
+operations belong to the shared training lifecycle.
+
+For example, GAE uses different masks for bootstrapping and trace continuation:
 
 ```text
 td_error_t = reward_t
@@ -60,25 +64,29 @@ advantage_t = td_error_t
 value_target_t = V(state_t) + advantage_t
 ```
 
-This means a time-limit truncation still bootstraps from the true final state,
-but neither termination nor truncation allows the recursive trace to enter the
-next episode. The corresponding tensor operations are in
+A time-limit truncation therefore bootstraps from its true final state, while
+neither a termination nor a truncation lets the recursive trace cross into the
+next episode. The corresponding operations are implemented in
 [advantages.py](src/deeprl/advantages.py), with final observations preserved by
 [rollouts.py](src/deeprl/rollouts.py) and [buffers.py](src/deeprl/buffers.py).
 
-Other deliberate implementation choices include:
+The same approach is now shaping the off-policy foundation. The DQN derivation
+separates generalized Q-learning into three independently scheduled processes:
+data collection, target-network refresh, and Q-function fitting. This is the
+architecture currently being translated into the replay and Q-learning code.
 
-- rollout collection and target construction do not retain neural-network
-  computation graphs;
-- advantages and value targets remain fixed throughout an update;
-- PPO evaluates new log probabilities against the actions and log probabilities
-  stored by the collecting policy;
-- NPG and TRPO compute Fisher-vector products without materializing a parameter
-  by parameter Fisher matrix;
-- TRPO evaluates the finite candidate step and restores the old parameters when
-  every line-search candidate fails.
+[![Generalized Q-learning as data collection, target refresh, and Q-function fitting](assets/generalized-q-learning.png)](mathematical_derivations/21_Deep-Q-Network.pdf)
 
-## Using PPO
+Across the implemented algorithms:
+
+- rollout collection and target construction do not retain computation graphs;
+- advantages and value targets stay fixed throughout an on-policy update;
+- PPO compares current action log probabilities with those stored at collection;
+- NPG and TRPO use Fisher-vector products without materializing the Fisher matrix;
+- TRPO checks finite candidate steps and restores the old policy if its line
+  search fails.
+
+## Quick Start
 
 Python 3.12 or later is required. Dependencies are managed with
 [uv](https://docs.astral.sh/uv/).
@@ -89,7 +97,7 @@ cd Deep-Reinforcement-Learning
 uv sync
 ```
 
-The policy and value networks are ordinary PyTorch modules supplied by the
+Policies and value functions are ordinary PyTorch modules supplied by the
 caller:
 
 ```python
@@ -121,47 +129,24 @@ finally:
     envs.close()
 ```
 
-## Code Structure
+## Roadmap
 
-```text
-src/deeprl/
-  advantages.py          return, advantage, and value-target estimators
-  buffers.py             time-major rollout storage and minibatching
-  rollouts.py            vector-environment collection
-  policies.py            stochastic policy modules
-  value.py               state-value modules
-  evaluate.py            isolated policy evaluation and seed aggregation
-  logger.py              interval metrics and run artifacts
-  algorithms/
-    on_policy.py         shared collection-update lifecycle
-    a2c.py               Advantage Actor-Critic
-    npg.py               Natural Policy Gradient
-    trpo.py              Trust Region Policy Optimization
-    ppo.py               Proximal Policy Optimization
-```
+Work will proceed in this order:
 
-## Mathematical Derivations
-
-The supporting derivations include
-[policy-gradient preliminaries](mathematical_derivations/13_Policy-Gradient-Preliminaries.pdf),
-the [Policy Gradient Theorem](mathematical_derivations/10_Policy-Gradient-Theorem.pdf), an
-[episodic trajectory derivation](mathematical_derivations/12_Policy-Gradient-Theorem_Episodic-Trajectory-Route.pdf),
-the [average-reward theorem](mathematical_derivations/11_Average-Reward-Policy-Gradient-Theorem.pdf),
-and [REINFORCE](mathematical_derivations/14_REINFORCE.pdf). Algorithm-specific derivations are linked
-in the table above.
-
-## Next
-
-1. Add configurable learner-owned optimizers and continuous-action policy
-   distributions.
-2. Validate PPO, NPG, and TRPO on Gymnasium and MuJoCo continuous-control tasks.
-3. Add replay storage, target networks, DQN, Double DQN, DDPG, TD3, and SAC.
-4. Harden the library through public tests, reproducible benchmarks,
-   checkpointing, and GPU-native environment support.
+1. Complete DQN and Double DQN on the shared replay-buffer foundation.
+2. Add configurable optimizers and reusable policy, value, and Q-function
+   interfaces for discrete and continuous control.
+3. Implement DDPG, TD3, and SAC.
+4. Establish reproducible multi-seed Gymnasium and MuJoCo benchmarks.
+5. Add offline RL, beginning with TD3+BC, AWAC, IQL, and CQL.
+6. Add model-based RL and recurrent, visual, transformer, ACT, and diffusion
+   policy architectures.
+7. Extend the training systems to real-robot data, deployment, and VLA
+   post-training.
 
 ## Related Repositories
 
-- **Mathematical foundations:** [Real Analysis](https://github.com/SaiSampathKedari/Real-Analysis) · [Probability and Distribution Theory](https://github.com/SaiSampathKedari/Probability-and-Distribution-Theory) · [Statistical Inference Theory](https://github.com/SaiSampathKedari/Statistical-Inference-Theory)
+- **Mathematical foundations:** [Real Analysis](https://github.com/SaiSampathKedari/Real-Analysis) | [Probability and Distribution Theory](https://github.com/SaiSampathKedari/Probability-and-Distribution-Theory) | [Statistical Inference Theory](https://github.com/SaiSampathKedari/Statistical-Inference-Theory)
 - **Sequential-decision theory:** [Sequential Decision Making](https://github.com/SaiSampathKedari/Sequential-Decision-Making)
 - **Classical reinforcement learning:** [Reinforcement Learning](https://github.com/SaiSampathKedari/Reinforcement-Learning)
 
