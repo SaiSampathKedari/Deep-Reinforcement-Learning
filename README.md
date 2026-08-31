@@ -75,7 +75,7 @@ separates generalized Q-learning into three independently scheduled processes:
 data collection, target-network refresh, and Q-function fitting. This is the
 architecture currently being translated into the replay and Q-learning code.
 
-[![Generalized Q-learning as data collection, target refresh, and Q-function fitting](assets/generalized-q-learning.png)](mathematical_derivations/21_Deep-Q-Network.pdf)
+[![An agent performing generalized Q-learning through data collection, target-network refresh, and Q-function fitting](assets/generalized-q-learning.png)](mathematical_derivations/21_Deep-Q-Network.pdf)
 
 Across the implemented algorithms:
 
