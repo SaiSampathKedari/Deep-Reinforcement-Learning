@@ -22,17 +22,17 @@ Gymnasium and MuJoCo benchmarks, and robotics policy deployment.
 
 ### On-Policy Optimization (Implemented)
 
-- [One-step actor-critic](src/deeprl/algorithms/one_step_actor_critic.py) ([Actor-Critic](mathematical_derivations/15_Actor-Critic.pdf), [baseline](mathematical_derivations/16_Actor-Critic-with-a-Baseline.pdf))
-- [A2C](src/deeprl/algorithms/a2c.py) ([GAE Actor-Critic](mathematical_derivations/17_GAE_Actor-Critic.pdf))
-- [Natural Policy Gradient](src/deeprl/algorithms/npg.py) ([derivation](mathematical_derivations/18_Natural-Policy-Gradient.pdf))
-- [TRPO](src/deeprl/algorithms/trpo.py) ([derivation](mathematical_derivations/19_Trust-Region-Policy-Optimization.pdf))
+- [One-step actor-critic](src/deeprl/algorithms/one_step_actor_critic.py) ([Actor-Critic](mathematical_derivations/18_Actor-Critic.pdf), [baseline](mathematical_derivations/19_Actor-Critic-with-a-Baseline.pdf))
+- [A2C](src/deeprl/algorithms/a2c.py) ([GAE Actor-Critic](mathematical_derivations/20_GAE_Actor-Critic.pdf))
+- [Natural Policy Gradient](src/deeprl/algorithms/npg.py) ([derivation](mathematical_derivations/21_Natural-Policy-Gradient.pdf))
+- [TRPO](src/deeprl/algorithms/trpo.py) ([derivation](mathematical_derivations/22_Trust-Region-Policy-Optimization.pdf))
 - [PPO-Clip](src/deeprl/algorithms/ppo.py) (derivation in progress)
 
 ### Off-Policy Learning (In Development)
 
-- **DQN:** [derivation](mathematical_derivations/21_Deep-Q-Network.pdf); implementation in progress
-- **Double DQN:** derivation and implementation in progress
-- **DDPG:** [Deterministic Policy Gradient](mathematical_derivations/23_Deterministic-Policy-Gradient.pdf) and [DDPG](mathematical_derivations/24_Deep-Deterministic-Policy-Gradient.pdf) derivations complete
+- **DQN:** [derivation](mathematical_derivations/24_Deep-Q-Network.pdf); implementation in progress
+- **Double DQN:** [derivation](mathematical_derivations/25_Double-DQN.pdf); implementation in progress
+- **DDPG:** [Deterministic Policy Gradient](mathematical_derivations/26_Deterministic-Policy-Gradient.pdf) and [DDPG](mathematical_derivations/27_Deep-Deterministic-Policy-Gradient.pdf) derivations complete
 
 ## From Derivations to Systems
 
@@ -47,9 +47,15 @@ generalized Q-learning into independently scheduled data collection,
 target-network refresh, and Q-function fitting. That decomposition defines the
 off-policy system now being built.
 
-[![An agent performing generalized Q-learning through data collection, target-network refresh, and Q-function fitting](assets/generalized-q-learning.png)](mathematical_derivations/21_Deep-Q-Network.pdf)
+[![An agent performing generalized Q-learning through data collection, target-network refresh, and Q-function fitting](assets/generalized-q-learning.png)](mathematical_derivations/24_Deep-Q-Network.pdf)
 
-[Browse all mathematical derivations](mathematical_derivations/)
+[Browse the mathematical derivation index](mathematical_derivations/README.md).
+Numbers follow one shared reading sequence with
+[Reinforcement Learning](https://github.com/SaiSampathKedari/Reinforcement-Learning/tree/master/mathematical_derivations):
+01–12 cover MDP foundations, tabular methods, and approximation; 13–20 are
+shared policy-gradient and actor-critic foundations; 21–27 continue here with
+natural gradients, trust regions, deep Q-learning, and deterministic policy
+gradients. Slots 12 and 23 are reserved for derivations in progress.
 
 ## Development Setup
 
