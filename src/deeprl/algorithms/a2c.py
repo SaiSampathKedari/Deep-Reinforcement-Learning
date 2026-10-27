@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,12 @@ class A2CConfig(OnPolicyConfig):
     max_grad_norm       :   float        = 0.5      # Global L2 gradient clipping threshold.
     normalize_advantage :   bool         = False
 
+    # PyTorch optimizer classes and options, excluding params and lr.
+    actor_optimizer_class   :   type[torch.optim.Optimizer] = torch.optim.Adam
+    actor_optimizer_kwargs  :   dict[str, Any] = field(default_factory=dict)
+    critic_optimizer_class  :   type[torch.optim.Optimizer] = torch.optim.Adam
+    critic_optimizer_kwargs :   dict[str, Any] = field(default_factory=dict)
+
 
 class A2CLearner(OnPolicyLearner):
     """A2C optimizers and algorithm-specific full-rollout update."""
@@ -49,13 +55,17 @@ class A2CLearner(OnPolicyLearner):
     ) -> None:
         super().__init__(policy, value_fn, cfg)
         self.cfg: A2CConfig = cfg
-        self.optim_actor = torch.optim.SGD(
+
+        # Construct optimizers after the networks are moved to their device.
+        self.optim_actor = cfg.actor_optimizer_class(
             self.policy.parameters(),
-            lr=self.cfg.lr_actor,
+            lr=cfg.lr_actor,
+            **cfg.actor_optimizer_kwargs,
         )
-        self.optim_critic = torch.optim.SGD(
+        self.optim_critic = cfg.critic_optimizer_class(
             self.value_fn.parameters(),
-            lr=self.cfg.lr_critic,
+            lr=cfg.lr_critic,
+            **cfg.critic_optimizer_kwargs,
         )
 
     def update(
@@ -75,8 +85,7 @@ class A2CLearner(OnPolicyLearner):
         self.policy.train()
         self.value_fn.train()
 
-        # Accumulate metrics over the complete update. A2C currently produces
-        # one full-rollout batch, B = T * N.
+        # Accumulate metrics over the full rollout, B = T * N.
         metric_sums: dict[str, float] = {
             "losses/policy_loss": 0.0,
             "losses/value_loss": 0.0,
@@ -87,8 +96,7 @@ class A2CLearner(OnPolicyLearner):
         num_samples = 0
         gradient_steps = 0
 
-        # Normalize once over the complete rollout so the update uses one fixed
-        # set of advantage weights, matching the other on-policy learners.
+        # Normalize advantages once over the complete rollout.
         if self.cfg.normalize_advantage and advantages.numel() > 1:
             advantages = (
                 advantages - advantages.mean()

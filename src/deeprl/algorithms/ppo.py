@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -46,6 +46,12 @@ class PPOConfig(OnPolicyConfig):
     # Optional policy-KL early stopping
     target_kl           :   float | None = None
 
+    # PyTorch optimizer classes and options, excluding params and lr.
+    actor_optimizer_class   :   type[torch.optim.Optimizer] = torch.optim.Adam
+    actor_optimizer_kwargs  :   dict[str, Any] = field(default_factory=dict)
+    critic_optimizer_class  :   type[torch.optim.Optimizer] = torch.optim.Adam
+    critic_optimizer_kwargs :   dict[str, Any] = field(default_factory=dict)
+
 
 class PPOLearner(OnPolicyLearner):
     """PPO-Clip optimizers and multi-epoch minibatch update."""
@@ -59,13 +65,16 @@ class PPOLearner(OnPolicyLearner):
         super().__init__(policy, value_fn, cfg)
         self.cfg: PPOConfig = cfg
 
-        self.optim_actor = torch.optim.SGD(
+        # Construct optimizers after the networks are moved to their device.
+        self.optim_actor = cfg.actor_optimizer_class(
             self.policy.parameters(),
-            lr=self.cfg.lr_actor,
+            lr=cfg.lr_actor,
+            **cfg.actor_optimizer_kwargs,
         )
-        self.optim_critic = torch.optim.SGD(
+        self.optim_critic = cfg.critic_optimizer_class(
             self.value_fn.parameters(),
-            lr=self.cfg.lr_critic,
+            lr=cfg.lr_critic,
+            **cfg.critic_optimizer_kwargs,
         )
 
     def update(

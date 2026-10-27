@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -119,6 +119,10 @@ class NPGConfig(OnPolicyConfig):
     normalize_advantage :   bool = True
     batch_size          :   int | None = None
 
+    # Critic optimizer class and options, excluding params and lr.
+    critic_optimizer_class  :   type[torch.optim.Optimizer] = torch.optim.Adam
+    critic_optimizer_kwargs :   dict[str, Any] = field(default_factory=dict)
+
 
 class NPGLearner(OnPolicyLearner):
     """Natural policy-gradient and critic updates."""
@@ -139,9 +143,10 @@ class NPGLearner(OnPolicyLearner):
         )
 
         # NPG computes the policy step directly; only the critic uses an optimizer.
-        self.optim_critic = torch.optim.SGD(
+        self.optim_critic = cfg.critic_optimizer_class(
             self.value_fn.parameters(),
-            lr=self.cfg.lr_critic,
+            lr=cfg.lr_critic,
+            **cfg.critic_optimizer_kwargs,
         )
 
     def _surrogate_objective(

@@ -1,7 +1,9 @@
+"""One-step actor-critic with vectorized environment updates."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -20,6 +22,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class OneStepACConfig:
+    """Training and optimization settings for one-step actor-critic."""
+
     total_timesteps :   int          = 500_000
     gamma           :   float        = 0.99
     seed            :   int          = 0
@@ -28,6 +32,12 @@ class OneStepACConfig:
     lr_actor        :   float        = 1e-3
     lr_critic       :   float        = 1e-2
     discount_actor  :   bool         = True
+
+    # PyTorch optimizer classes and options, excluding params and lr.
+    actor_optimizer_class   :   type[torch.optim.Optimizer] = torch.optim.Adam
+    actor_optimizer_kwargs  :   dict[str, Any] = field(default_factory=dict)
+    critic_optimizer_class  :   type[torch.optim.Optimizer] = torch.optim.Adam
+    critic_optimizer_kwargs :   dict[str, Any] = field(default_factory=dict)
 
 
 def one_step_actor_critic(
@@ -39,12 +49,10 @@ def one_step_actor_critic(
     logger          :   Logger | None = None,
     evaluator       :   Evaluator | None = None,
 ) -> MetricHistory:
+    """Update the actor and critic once per vector step using one-step TD targets."""
 
-
-    # The Whole algorithm rests on this: under DISABLED every returned row is a
-    # genuine transition and next_obs is the true final observation, so there is
-    # no filler step to mask. Gymnasium's defalut is NEXT_STEP, which would both
-    # feed a fabricated transistion into the update and double--reset.
+    # DISABLED preserves the true next/final observation for every transition.
+    # Finished environments are reset explicitly after the update.
     assert envs.metadata.get("autoreset_mode") is AutoresetMode.DISABLED, (
         "this algorithm assumes AutoresetMode.DISABLED: it resets finished "
         f"sub-environments itself via reset_mask. Got {envs.metadata.get("autoreset_mode")}."
@@ -55,10 +63,7 @@ def one_step_actor_critic(
     # Setup
     # ------------------------------------------------------------------
 
-    # Owns the global step counter, per-environment episode accumulators,
-    # interval averaging and the optional TensorBoard mirror.
-    # ev_name: this algorithm's critic regresses on a one-step TD target, not
-    # on empirical returns, so the two must not share a metric key.
+    # Use a distinct explained-variance metric for one-step TD targets.
     owns_logger = logger is None
     if logger is None:
         logger = Logger(
@@ -73,8 +78,17 @@ def one_step_actor_critic(
     policy   = policy.to(device=cfg.device)
     value_fn = value_fn.to(device=cfg.device)
 
-    optim_actor  = torch.optim.SGD(policy.parameters(),   lr=cfg.lr_actor)
-    optim_critic = torch.optim.SGD(value_fn.parameters(), lr=cfg.lr_critic)
+    # Construct optimizers after the networks are moved to their device.
+    optim_actor = cfg.actor_optimizer_class(
+        policy.parameters(),
+        lr=cfg.lr_actor,
+        **cfg.actor_optimizer_kwargs,
+    )
+    optim_critic = cfg.critic_optimizer_class(
+        value_fn.parameters(),
+        lr=cfg.lr_critic,
+        **cfg.critic_optimizer_kwargs,
+    )
 
     # Initial observation batch.
     # Shape: (N, *observation_shape).
@@ -153,8 +167,7 @@ def one_step_actor_critic(
         # TD errors are fixed weights for the policy-gradient update.
         actor_weights : torch.Tensor = td_errors.detach()
 
-        # S&B p.332 weights the actor update by I_t = gamma^t; nearly every
-        # implementation drops it. Applied here so the flag is visible.
+        # Optionally weight the actor update by the episode discount I_t = gamma^t.
         if cfg.discount_actor:
             actor_weights = discounts * actor_weights
 
@@ -168,9 +181,7 @@ def one_step_actor_critic(
         # 4. Parameter updates
         # --------------------------------------------------------------
 
-        # Gradient norms are read between backward() and step(): that is the
-        # only point where they are guaranteed to exist, and where clipping
-        # would later be applied.
+        # Measure gradient norms after backward() and before the optimizer step.
 
         # Critic semi-gradient update.
         optim_critic.zero_grad(set_to_none=True)
@@ -188,12 +199,8 @@ def one_step_actor_critic(
         # 5. Metrics
         # --------------------------------------------------------------
 
-        # Collection, learner statistics and reporting are separate operations.
-        # This makes each emitted point describe complete updates only.
-        #
-        # values and td_targets feed a rolling window from which explained
-        # variance is computed: over a single vector step there are only N
-        # points, and Var[td_targets] over N points is meaningless.
+        # Report complete updates and compute explained variance from a rolling
+        # window of value/target pairs, rather than a single vector step.
         logger.log_step(
             rewards,
             dones,
@@ -254,5 +261,5 @@ def one_step_actor_critic(
     if evaluator is not None:
         evaluator.evaluate_now(policy, logger)
 
-    # Flushes the final partial logging interval before returning.
+    # Flush the final partial interval only when this function owns the logger.
     return logger.finish() if owns_logger else logger.history
