@@ -19,6 +19,7 @@ dependencies = [
     "matplotlib",
     "pyyaml",  # experiment configs (section 11)
     "tqdm",
+    "tensordict>=0.14.1",
 ]
 
 # numpy and scipy are deliberately absent: this package never imports numpy

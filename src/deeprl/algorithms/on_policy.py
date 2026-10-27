@@ -121,8 +121,6 @@ def train_on_policy(
     rollout_buffer = RolloutBuffer(
         rollout_steps=T,
         num_envs=N,
-        observation_space=envs.single_observation_space,
-        action_space=envs.single_action_space,
         device=cfg.device,
     )
 
