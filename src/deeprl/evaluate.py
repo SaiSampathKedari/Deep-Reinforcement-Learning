@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 from torch.distributions import Distribution
 
+from deeprl.buffers import TensorData
+from deeprl.env import from_tensor_data, to_tensor_data
 from deeprl.logger import Logger
 
 
@@ -18,7 +20,7 @@ def _evaluation_action(
     distribution: Distribution,
     *,
     deterministic: bool,
-) -> torch.Tensor:
+) -> TensorData:
     if not deterministic:
         return distribution.sample()
     try:
@@ -66,21 +68,14 @@ def evaluate_policy(
                 done = False
 
                 while not done:
-                    observation_tensor = torch.as_tensor(
-                        observation,
-                        dtype=torch.float32,
-                        device=device,
-                    ).unsqueeze(0)
+                    observation_tensor = to_tensor_data(observation, device=device)
                     distribution: Distribution = policy(observation_tensor)
                     action = _evaluation_action(
                         distribution,
                         deterministic=deterministic,
-                    ).squeeze(0)
-
-                    if isinstance(env.action_space, gym.spaces.Discrete):
-                        env_action = int(action.item())
-                    else:
-                        env_action = action.detach().cpu().tolist()
+                    )
+                    action = to_tensor_data(action, batch_size=1)[0]
+                    env_action = from_tensor_data(action, env.action_space, numpy=True)
 
                     observation, reward, terminated, truncated, _ = env.step(env_action)
                     episode_return += float(reward)

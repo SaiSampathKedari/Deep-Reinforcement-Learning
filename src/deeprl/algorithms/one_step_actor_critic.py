@@ -10,6 +10,7 @@ import torch.nn as nn
 from gymnasium.vector import AutoresetMode, VectorEnv
 from torch.distributions import Distribution
 
+from deeprl.env import from_tensor_data, to_tensor_data
 from deeprl.logger import Logger, MetricHistory
 from deeprl.stats import TrainingStats
 from deeprl.utils import grad_norm
@@ -91,8 +92,9 @@ def one_step_actor_critic(
     )
 
     # Initial observation batch.
-    # Shape: (N, *observation_shape).
+    # Each leaf has shape (N, *observation_shape).
     obs, _ = envs.reset(seed=cfg.seed)
+    obs = to_tensor_data(obs, batch_size=envs.num_envs, device=cfg.device)
 
     # Per-environment I_t = gamma^t.
     # Each environment can be at a different time within its episode.
@@ -112,8 +114,11 @@ def one_step_actor_critic(
 
         # Sample one action per environment;
         # No gradient through sample().
-        # Shape: (N,) discrete or (N, action_dim) continuous.
-        actions : torch.Tensor = action_dist.sample()
+        # Structured distributions accept TensorDict actions in log_prob(),
+        # matching the canonical actions used by rollout-based updates.
+        actions = to_tensor_data(
+            action_dist.sample(), batch_size=envs.num_envs, device=cfg.device
+        )
 
         # Differentiable w.r.t. policy parameters.
         # Shape: (N,) when each environment's action is treated as one event.
@@ -129,7 +134,10 @@ def one_step_actor_critic(
         # - every returned row is a genuine transition;
         # - next_obs contains the actual next or final observations;
         # - completed environments are reset explicitly after the update.
-        next_obs, rewards, terminations, truncations, _ = envs.step(actions)
+        next_obs, rewards, terminations, truncations, _ = envs.step(
+            from_tensor_data(actions, envs.single_action_space)
+        )
+        next_obs = to_tensor_data(next_obs, batch_size=envs.num_envs, device=cfg.device)
 
         # Each environment episode finishes through either termination
         # or truncation. Shape: (N,), dtype: bool.
@@ -251,6 +259,7 @@ def one_step_actor_critic(
             # - reset observations for completed environments;
             # - unchanged next_obs entries for continuing environments.
             obs, _ = envs.reset(options={"reset_mask": dones})
+            obs = to_tensor_data(obs, batch_size=envs.num_envs, device=cfg.device)
 
         else:
 

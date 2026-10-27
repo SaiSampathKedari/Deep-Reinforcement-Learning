@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from gymnasium.vector import VectorEnv
 from torch.distributions import Distribution
 
-from gymnasium.vector import VectorEnv
-
-from deeprl.buffers import RolloutBuffer
+from deeprl.buffers import RolloutBuffer, TensorData
+from deeprl.env import from_tensor_data, to_tensor_data
 
 
 @torch.no_grad()
@@ -17,18 +17,20 @@ def collect_rollout(
     policy          :   nn.Module,
     value_fn        :   nn.Module,
     buffer          :   RolloutBuffer,
-    observations    :   torch.Tensor,
-) -> torch.Tensor:
+    observations    :   TensorData | dict | tuple,
+) -> TensorData:
     """Collect one T-step rollout from N vectorized environments.
 
     The buffer is full on return. The returned observations have shape
     (N, *obs_shape) and are the starting states for the next rollout.
-    Network outputs are stored without autograd graphs. Collection requires
-    AutoresetMode.DISABLED.
+    Dict/Tuple observations are represented by nested TensorDicts with batch
+    size (N,). Network outputs are stored without autograd graphs. Collection
+    requires NumpyToTorch and AutoresetMode.DISABLED.
     """
 
     # Restart writing at the first row of the preallocated rollout storage.
     buffer.reset()
+    observations = to_tensor_data(observations, batch_size=envs.num_envs)
 
     for _ in range(buffer.rollout_steps):
 
@@ -44,9 +46,10 @@ def collect_rollout(
         action_distributions: Distribution = policy(observations)
 
         # Actions: (N,) for discrete actions or (N, *action_shape) otherwise.
-        actions: torch.Tensor = action_distributions.sample()
+        actions = to_tensor_data(action_distributions.sample(), batch_size=envs.num_envs)
 
         # Collection-time log pi(A|S). Shape: (N,).
+        # Structured distributions consume TensorDict actions here and during updates.
         log_probs: torch.Tensor = action_distributions.log_prob(actions)
 
         # --------------------------------------------------------------
@@ -58,7 +61,9 @@ def collect_rollout(
         #
         # next_observations: (N, *obs_shape)
         # rewards, terminations, truncations: (N,)
-        next_observations, rewards, terminations, truncations, _ = envs.step(actions)
+        env_actions = from_tensor_data(actions, envs.single_action_space)
+        next_observations, rewards, terminations, truncations, _ = envs.step(env_actions)
+        next_observations = to_tensor_data(next_observations, batch_size=envs.num_envs)
 
         # --------------------------------------------------------------
         # 3. Transition storage
@@ -92,6 +97,7 @@ def collect_rollout(
             # reset observations for completed environments and unchanged next
             # observations for continuing environments.
             observations, _ = envs.reset(options={"reset_mask":dones})
+            observations = to_tensor_data(observations, batch_size=envs.num_envs)
 
         else:
 
@@ -104,7 +110,7 @@ def collect_rollout(
 @torch.no_grad()
 def evaluate_next_values(
     value_fn            :   nn.Module,
-    next_observations   :   torch.Tensor,
+    next_observations   :   TensorData,
     terminations        :   torch.Tensor,
 ) -> torch.Tensor:
     """Evaluate V(S_{t+1}) for every nonterminated rollout transition."""
@@ -117,7 +123,7 @@ def evaluate_next_values(
     next_values = torch.zeros(
         terminations.shape,
         dtype=torch.float32,
-        device=next_observations.device
+        device=terminations.device
     )
 
     # Boolean indexing gathers all selected next observations into one batch:
