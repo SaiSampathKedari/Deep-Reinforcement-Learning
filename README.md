@@ -68,6 +68,10 @@ cd Deep-Reinforcement-Learning
 uv sync
 ```
 
+For a runnable CPU example with checkpoints, evaluation, videos, and learning
+curves, see [PPO on CartPole](examples/gymnasium/cartpole/README.md). Its settings
+and networks are separate from the PPO implementation.
+
 ## Roadmap
 
 **Now:** DQN, Double DQN, and the shared replay and Q-learning system.

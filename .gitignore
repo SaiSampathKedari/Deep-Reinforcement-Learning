@@ -56,3 +56,4 @@ src/deeprl/train.py
 tests/
 notebooks/
 docs/
+outputs/
