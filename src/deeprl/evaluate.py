@@ -115,6 +115,11 @@ class Evaluator:
         self._next_eval_step = eval_every
         self._last_eval_step: int | None = None
 
+    def resume(self, global_step: int) -> None:
+        """Continue the evaluation schedule after a restored training step."""
+        self._next_eval_step = (global_step // self.eval_every + 1) * self.eval_every
+        self._last_eval_step = None
+
     def _evaluate(self, policy: nn.Module, logger: Logger) -> None:
         for deterministic in (True, False):
             returns, lengths = evaluate_policy(

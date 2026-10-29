@@ -18,6 +18,7 @@ from deeprl.utils import explained_variance
 
 if TYPE_CHECKING:
     from _io import TextIOWrapper
+
     from torch.utils.tensorboard import SummaryWriter
     from tqdm import tqdm
 
@@ -102,6 +103,7 @@ class Logger:
         self._ev_targets: deque[float] = deque(maxlen=ev_window)
 
         self._start_time = time.perf_counter()
+        self._start_step = 0
         self._last_dump_time = self._start_time
         self._last_dump_step = 0
         self._next_log_step = log_every if log_every > 0 else None
@@ -117,6 +119,41 @@ class Logger:
             from tqdm import tqdm
 
             self._progress = tqdm(total=total_timesteps, unit="step", dynamic_ncols=True)
+
+    def resume(self, *, global_step: int, gradient_step: int) -> None:
+        """Restore counters and start fresh episode statistics and session timing."""
+        if global_step < 0 or gradient_step < 0:
+            raise ValueError("global_step and gradient_step must be non-negative")
+
+        self.global_step = global_step
+        self.gradient_step = gradient_step
+        self._history.clear()
+        self._episode_returns.zero_()
+        self._episode_lengths.zero_()
+        self._recent_returns.clear()
+        self._recent_lengths.clear()
+        self._metric_sums.clear()
+        self._metric_weights.clear()
+        self._ev_values.clear()
+        self._ev_targets.clear()
+
+        self._start_time = time.perf_counter()
+        self._start_step = global_step
+        self._last_dump_time = self._start_time
+        self._last_dump_step = global_step
+        self._next_log_step = (
+            (global_step // self.log_every + 1) * self.log_every
+            if self.log_every > 0
+            else None
+        )
+
+        if self._progress is not None:
+            self._progress.reset()
+            position = min(global_step, self._progress.total)
+            self._progress.n = position
+            self._progress.initial = position
+            self._progress.last_print_n = position
+            self._progress.refresh()
 
     # -------------------------------------------------------------- collection
 
@@ -243,7 +280,7 @@ class Logger:
         elapsed = now - self._start_time
         interval_elapsed = now - self._last_dump_time
         interval_steps = self.global_step - self._last_dump_step
-        metrics["charts/SPS"] = self.global_step / max(elapsed, 1e-8)
+        metrics["charts/SPS"] = (self.global_step - self._start_step) / max(elapsed, 1e-8)
         metrics["charts/interval_SPS"] = interval_steps / max(interval_elapsed, 1e-8)
 
         self._emit("train", metrics, elapsed_seconds=elapsed)

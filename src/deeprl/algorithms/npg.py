@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -494,6 +495,10 @@ def npg(
     writer          :   SummaryWriter | None = None,
     logger          :   Logger | None = None,
     evaluator       :   Evaluator | None = None,
+    checkpoint_dir: str | Path | None = None,
+    checkpoint_interval: int | None = None,
+    run_config: dict[str, Any] | None = None,
+    resume_from: str | Path | None = None,
 ) -> MetricHistory:
     """Construct an NPG learner and run the shared on-policy training loop."""
     learner = NPGLearner(policy, value_fn, cfg)
@@ -504,4 +509,8 @@ def npg(
         writer=writer,
         logger=logger,
         evaluator=evaluator,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_interval=checkpoint_interval,
+        run_config=run_config,
+        resume_from=resume_from,
     )

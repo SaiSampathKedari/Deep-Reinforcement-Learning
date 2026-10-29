@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -12,6 +14,7 @@ from gymnasium.vector import AutoresetMode, VectorEnv
 
 from deeprl.advantages import generalized_advantage_estimate
 from deeprl.buffers import RolloutBuffer
+from deeprl.checkpoint import load_checkpoint, save_checkpoint
 from deeprl.logger import Logger, MetricHistory
 from deeprl.rollouts import collect_rollout, evaluate_next_values
 from deeprl.stats import TrainingStats
@@ -81,22 +84,31 @@ def train_on_policy(
     writer          :   SummaryWriter | None = None,
     logger          :   Logger | None = None,
     evaluator       :   Evaluator | None = None,
+    checkpoint_dir  :   str | Path | None = None,
+    checkpoint_interval:   int | None = None,
+    run_config      :   dict[str, Any] | None = None,
+    resume_from     :   str | Path | None = None,
 ) -> MetricHistory:
     """Run the shared synchronous on-policy training lifecycle.
 
     Collects T steps from N environments, computes GAE, and delegates the
     algorithm-specific optimization schedule to the learner.
+
+    Checkpoint intervals count completed rollout updates. Resume restores the
+    learner and counters, then starts fresh episodes toward total_timesteps.
+    Use the same environment and networks; simulator state is not restored.
+    run_config is optional JSON-compatible experiment metadata.
     """
     cfg = learner.cfg
+
+    if checkpoint_interval is not None and checkpoint_interval <= 0:
+        raise ValueError("checkpoint_interval must be positive or None")
+
+    checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
 
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
-
-    # Seed PyTorch action sampling and rollout shuffling.
-    torch.manual_seed(cfg.seed)
-    if cfg.device.type == "cuda":
-        torch.cuda.manual_seed_all(cfg.seed)
 
     # Collection stores true final observations and resets completed
     # environments explicitly after their transitions have been recorded.
@@ -104,16 +116,6 @@ def train_on_policy(
         "On-policy rollout collection requires AutoresetMode.DISABLED to store "
         "true final observations before resetting completed environments."
     )
-
-    # Reuse a caller-owned logger, or create one finalized by this function.
-    owns_logger = logger is None
-    if logger is None:
-        logger = Logger(envs.num_envs, cfg.log_every, writer, cfg.device)
-
-    logger.log_hyperparameters(cfg)
-
-    # Initial observation batch: (N, *obs_shape).
-    observations, _ = envs.reset(seed=cfg.seed)
 
     # T steps from each of N environments produce B = T * N transitions.
     N = envs.num_envs
@@ -123,11 +125,82 @@ def train_on_policy(
     # Only complete rollouts are collected and used for updates.
     num_updates = cfg.total_timesteps // rollout_size
 
+    # Store config values, not executable optimizer classes, so the checkpoint
+    # remains readable with torch.load(weights_only=True).
+    learner_config = asdict(cfg)
+    for name, value in learner_config.items():
+        if isinstance(value, type):
+            learner_config[name] = f"{value.__module__}.{value.__qualname__}"
+        elif isinstance(value, torch.device):
+            learner_config[name] = str(value)
+
+    algorithm = f"{type(learner).__module__}.{type(learner).__qualname__}"
+    start_update = 0
+    checkpoint = None
+    if resume_from is not None:
+        # RNG states stay on CPU; native state loaders move model and optimizer
+        # tensors to the devices of the learner's parameters.
+        checkpoint = load_checkpoint(resume_from, map_location="cpu")
+        if checkpoint.get("algorithm", algorithm) != algorithm:
+            raise ValueError("checkpoint algorithm does not match the learner")
+        if checkpoint.get("num_envs", N) != N:
+            raise ValueError("checkpoint num_envs does not match the environment")
+
+        saved_config = checkpoint.get("learner_config")
+        if saved_config is not None:
+            changed = [
+                name for name, value in learner_config.items()
+                if name not in {"total_timesteps", "device", "log_every"}
+                and saved_config.get(name) != value
+            ]
+            if changed:
+                raise ValueError(f"checkpoint learner config differs: {', '.join(changed)}")
+
+        progress = checkpoint["progress"]
+        start_update = progress["update"]
+        if (
+            start_update < 0
+            or progress["gradient_step"] < 0
+            or progress["global_step"] != start_update * rollout_size
+        ):
+            raise ValueError("checkpoint progress is inconsistent with the rollout size")
+        if num_updates <= start_update:
+            raise ValueError("total_timesteps leaves no remaining complete rollout")
+        if run_config is None:
+            run_config = checkpoint.get("config")
+
     if num_updates == 0:
         raise ValueError(
             f"total_timesteps={cfg.total_timesteps} is smaller than one rollout "
             f"({T} steps x {N} envs = {rollout_size}); nothing would be collected"
         )
+
+    # Keep metadata as plain values accepted by the restricted checkpoint loader.
+    if run_config is not None:
+        run_config = json.loads(json.dumps(run_config))
+
+    # Seed a new run; a resumed run restores its sampling RNG after setup.
+    torch.manual_seed(cfg.seed)
+    if cfg.device.type == "cuda":
+        torch.cuda.manual_seed_all(cfg.seed)
+    if checkpoint is not None:
+        learner.load_state_dict(checkpoint["learner"])
+
+    # Reuse a caller-owned logger, or create one finalized by this function.
+    owns_logger = logger is None
+    if logger is None:
+        logger = Logger(envs.num_envs, cfg.log_every, writer, cfg.device)
+    if checkpoint is not None:
+        logger.resume(
+            global_step=progress["global_step"],
+            gradient_step=progress["gradient_step"],
+        )
+        if evaluator is not None:
+            evaluator.resume(progress["global_step"])
+    logger.log_hyperparameters(cfg)
+
+    # Initial observation batch: (N, *obs_shape). Resume also starts new episodes.
+    observations, _ = envs.reset(seed=cfg.seed)
 
     # Time-major storage reused for every rollout: (T, N, ...).
     rollout_buffer = RolloutBuffer(
@@ -136,7 +209,16 @@ def train_on_policy(
         device=cfg.device,
     )
 
-    for _ in range(num_updates):
+    # Older checkpoints may contain learner/progress only. Restore RNG when
+    # available, after environment reset and storage initialization are done.
+    if checkpoint is not None and checkpoint.get("rng_state") is not None:
+        rng_state = checkpoint["rng_state"]
+        torch.set_rng_state(rng_state["torch"])
+        if cfg.device.type == "cuda" and rng_state.get("cuda") is not None:
+            torch.cuda.set_rng_state(rng_state["cuda"], device=cfg.device)
+    checkpoint = None
+
+    for update in range(start_update + 1, num_updates + 1):
 
         # --------------------------------------------------------------
         # 1. Rollout collection
@@ -225,6 +307,41 @@ def train_on_policy(
         # Evaluation also runs only at completed update boundaries.
         if evaluator is not None:
             evaluator.maybe_evaluate(learner.policy, logger)
+
+        # Checkpoint intervals count completed rollout updates.
+        if checkpoint_dir is not None:
+            save_due = (
+                checkpoint_interval is not None
+                and update % checkpoint_interval == 0
+            )
+
+            if save_due or update == num_updates:
+                checkpoint = {
+                    "algorithm"         : algorithm,
+                    "learner_config"    : learner_config,
+                    "num_envs"          : N,
+                    "learner"           : learner.state_dict(),
+                    "config"            : run_config,
+                    "progress"          : {
+                        "global_step"   : logger.global_step,
+                        "gradient_step" : logger.gradient_step,
+                        "update"        : update,
+                    },
+                    "rng_state"         : {
+                        "torch"         : torch.get_rng_state(),
+                        "cuda"          : (
+                            torch.cuda.get_rng_state(cfg.device)
+                            if cfg.device.type == "cuda" else None
+                        ),
+                    },
+                }
+                save_checkpoint(checkpoint_dir / "last.pt", checkpoint)
+
+                if save_due:
+                    save_checkpoint(
+                        checkpoint_dir / f"step_{logger.global_step}.pt",
+                        checkpoint
+                    )
 
     # ------------------------------------------------------------------
     # Final evaluation and cleanup
