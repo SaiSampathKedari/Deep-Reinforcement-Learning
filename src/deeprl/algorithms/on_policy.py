@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -50,6 +50,18 @@ class OnPolicyLearner(ABC):
         self.cfg = cfg
         self.policy = policy.to(self.cfg.device)
         self.value_fn = value_fn.to(self.cfg.device)
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return the policy and value-function states."""
+        return {
+            "policy": self.policy.state_dict(),
+            "value_fn": self.value_fn.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore the policy and value-function states."""
+        self.policy.load_state_dict(state["policy"])
+        self.value_fn.load_state_dict(state["value_fn"])
 
     @abstractmethod
     def update(

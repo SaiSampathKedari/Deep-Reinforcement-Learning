@@ -149,6 +149,17 @@ class NPGLearner(OnPolicyLearner):
             **cfg.critic_optimizer_kwargs,
         )
 
+    def state_dict(self) -> dict[str, Any]:
+        """Return network and critic optimizer states."""
+        state = super().state_dict()
+        state["optim_critic"] = self.optim_critic.state_dict()
+        return state
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore network and critic optimizer states."""
+        super().load_state_dict(state)
+        self.optim_critic.load_state_dict(state["optim_critic"])
+
     def _surrogate_objective(
         self,
         batch       :   RolloutBatch,
