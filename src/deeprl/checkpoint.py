@@ -6,6 +6,8 @@ additional required keys; on-policy training requires num_envs. Optional
 obs_normalizer and reward_scaler entries hold component state dictionaries.
 Optional preprocessing_config records their non-tensor constructor settings;
 older checkpoints without it retain the same format version.
+Optional provenance identifies the code that wrote the checkpoint; it does not
+restrict continuation across versions.
 
 The only supported resume contract is "continue": restore supported learning
 state, not an exact uninterrupted trajectory. The on-policy trainer starts
@@ -15,6 +17,7 @@ validation does not invent missing state or relabel it as version 1.
 
 import warnings
 from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +28,66 @@ from deeprl.stats import TrainingProgress
 
 CHECKPOINT_FORMAT_VERSION = 1
 CHECKPOINT_RESUME_CONTRACT = "continue"
+
+
+def get_algorithm_id(learner_type: type) -> str:
+    """Use an explicitly declared stable ID, or the concrete class's full name.
+
+    IDs are not inherited: a custom subclass is a distinct algorithm unless it
+    explicitly opts into the same checkpoint contract as its parent.
+    """
+    identity = learner_type.__dict__.get(
+        "algorithm_id", f"{learner_type.__module__}.{learner_type.__qualname__}"
+    )
+    if not isinstance(identity, str) or not identity.strip():
+        raise ValueError("algorithm_id must be a non-empty string")
+    return identity
+
+
+def validate_checkpoint_algorithm(
+    checkpoint: Mapping[str, Any], learner_type: type,
+) -> None:
+    """Accept the current ID and explicitly supported historical class names."""
+    if "algorithm" not in checkpoint:
+        return  # Legacy omissions are reported by validate_training_checkpoint.
+    accepted = (
+        get_algorithm_id(learner_type),
+        f"{learner_type.__module__}.{learner_type.__qualname__}",
+        *learner_type.__dict__.get("legacy_algorithm_ids", ()),
+    )
+    if checkpoint["algorithm"] not in accepted:
+        raise ValueError("checkpoint algorithm does not match the learner")
+
+
+def build_training_checkpoint(
+    *,
+    algorithm: str,
+    learner_state: dict[str, Any],
+    learner_config: dict[str, Any],
+    progress: TrainingProgress,
+    rng_state: dict[str, Any],
+    run_config: dict[str, Any] | None = None,
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the common envelope from native state and plain configuration.
+
+    This does not capture state, clone model tensors, or write files. The caller
+    adds workflow-specific state and validates its required keys before saving.
+    """
+    checkpoint = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "resume_contract": CHECKPOINT_RESUME_CONTRACT,
+        "algorithm": algorithm,
+        "learner": learner_state,
+        "learner_config": learner_config,
+        "config": run_config,
+        "progress": asdict(progress),
+        "rng_state": rng_state,
+    }
+    if provenance is not None:
+        checkpoint["provenance"] = provenance
+    validate_training_checkpoint(checkpoint)
+    return checkpoint
 
 
 def _format_version(checkpoint: Mapping[str, Any]) -> int:
@@ -83,6 +146,8 @@ def validate_training_checkpoint(
             raise ValueError("checkpoint learner_config must be a mapping")
     if checkpoint.get("config") is not None and not isinstance(checkpoint["config"], Mapping):
         raise ValueError("checkpoint config must be a mapping or None")
+    if "provenance" in checkpoint and not isinstance(checkpoint["provenance"], Mapping):
+        raise ValueError("checkpoint provenance must be a mapping")
     if "num_envs" in checkpoint:
         num_envs = checkpoint["num_envs"]
         if type(num_envs) is not int or num_envs <= 0:

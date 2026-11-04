@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
+from numbers import Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -59,7 +61,7 @@ class PPOConfig(OnPolicyConfig):
     critic_optimizer_kwargs :   dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate PPO minibatch and epoch counts."""
+        """Validate PPO update counts and finite optimization coefficients."""
         super().__post_init__()
         
         for name, value in (
@@ -75,18 +77,46 @@ class PPOConfig(OnPolicyConfig):
                     f"{name} must be a positive integer, got {value!r}"
                 )
 
+        for name, value in (
+            ("lr_actor", self.lr_actor),
+            ("lr_critic", self.lr_critic),
+            ("ent_coef", self.ent_coef),
+            ("max_grad_norm", self.max_grad_norm),
+            ("clip_range", self.clip_range),
+            ("value_clip_range", self.value_clip_range),
+            ("log_ratio_clip", self.log_ratio_clip),
+            ("target_kl", self.target_kl),
+        ):
+            if value is None and name in {
+                "value_clip_range", "log_ratio_clip", "target_kl",
+            }:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not isfinite(value)
+                or value < 0.0
+            ):
+                raise ValueError(
+                    f"{name} must be a finite number >= 0, got {value!r}"
+                )
+
+
 class PPOLearner(OnPolicyLearner):
     """PPO-Clip optimizers and multi-epoch minibatch update."""
+
+    algorithm_id = "ppo"
+    legacy_algorithm_ids = ("deeprl.algorithms.ppo.PPOLearner",)
 
     mutable_on_resume = OnPolicyLearner.mutable_on_resume | {
         "lr_actor", "lr_critic", "ent_coef", "target_kl", "batch_size",
     }
-    resume_defaults = {
+    resume_defaults: ClassVar[dict[str, Any]] = {
         **OnPolicyLearner.resume_defaults,
         "normalize_advantage_per_minibatch": False,
         "normalize_value_targets": False,
     }
-    learning_rate_fields = {
+    learning_rate_fields: ClassVar[dict[str, str]] = {
         "lr_actor": "optim_actor",
         "lr_critic": "optim_critic",
     }

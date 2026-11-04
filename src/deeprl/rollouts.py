@@ -116,9 +116,11 @@ def collect_rollout(
             observations = to_tensor_data(observations, batch_size=envs.num_envs)
             if obs_normalizer is not None:
                 # Only reset entries are new samples; continuing observations
-                # were already included by the preceding environment step.
-                obs_normalizer.update(observations[dones])
-                observations = obs_normalizer(observations)
+                # must retain the representation already stored as next state.
+                reset_observations = observations[dones]
+                obs_normalizer.update(reset_observations)
+                observations = next_observations.clone()
+                observations[dones] = obs_normalizer(reset_observations)
 
         else:
 

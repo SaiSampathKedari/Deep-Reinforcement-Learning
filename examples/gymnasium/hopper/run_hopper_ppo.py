@@ -11,7 +11,6 @@ import torch
 from gymnasium.vector import AutoresetMode
 from gymnasium.wrappers.vector import NumpyToTorch
 from torch import nn
-from torch.utils.tensorboard import SummaryWriter
 
 from deeprl.training.train_on_policy import train_on_policy
 from deeprl.algorithms.ppo import PPOLearner
@@ -133,9 +132,14 @@ def main() -> None:
         eval_env = stack.enter_context(
             gym.wrappers.ClipAction(gym.make(settings.ENV_ID))
         )
-        writer = stack.enter_context(
-            SummaryWriter(log_dir=str(args.output_dir / "events"))
-        )
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+        except ImportError:
+            writer = None
+        else:
+            writer = stack.enter_context(
+                SummaryWriter(log_dir=str(args.output_dir / "events"))
+            )
 
         obs_dim = envs.single_observation_space.shape[0]
         action_dim = envs.single_action_space.shape[0]

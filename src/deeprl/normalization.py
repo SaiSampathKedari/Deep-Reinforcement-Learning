@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from numbers import Real
 
 import torch
 import torch.nn as nn
@@ -18,8 +19,16 @@ class RunningNormalizer(nn.Module):
         clip    :   float | None = 10.0,
     ) -> None:
         super().__init__()
-        if epsilon <= 0 or (clip is not None and clip <= 0):
-            raise ValueError("epsilon and clip must be positive")
+        for name, value in (("epsilon", epsilon), ("clip", clip)):
+            if name == "clip" and value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
         
         self.shape = tuple(shape)
         self.epsilon = epsilon
@@ -36,6 +45,8 @@ class RunningNormalizer(nn.Module):
         
         if not isinstance(x, torch.Tensor):
             raise TypeError("expected a Tensor; normalize structured inputs per key")
+        if x.is_complex():
+            raise TypeError("normalization samples must be real-valued")
         
         if self.shape and tuple(x.shape[-len(self.shape):]) != self.shape:
             raise ValueError(
@@ -48,6 +59,8 @@ class RunningNormalizer(nn.Module):
         batch_count = x.shape[0]
         if batch_count == 0:
             return
+        if not torch.isfinite(x).all().item():
+            raise ValueError("normalization samples must be finite")
 
         batch_var, batch_mean = torch.var_mean(x, dim=0, unbiased=False)
         total = self.count + batch_count
@@ -59,8 +72,19 @@ class RunningNormalizer(nn.Module):
             + batch_var * batch_count
             + delta.square() * (self.count * batch_count / total)
         )
-        self.mean.add_(delta * (batch_count / total))
-        self.var.copy_(sum_squares / total)
+        mean = (self.mean + delta * (batch_count / total)).to(self.mean)
+        var = (sum_squares / total).to(self.var)
+        total = total.to(self.count)
+        # Check the values actually committed, including destination-dtype casts.
+        valid_moments = (
+            torch.isfinite(mean).all()
+            & torch.isfinite(var).all()
+            & torch.isfinite(total)
+        )
+        if not valid_moments.item():
+            raise ValueError("normalization statistics overflowed; state was not updated")
+        self.mean.copy_(mean)
+        self.var.copy_(var)
         self.count.copy_(total)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -85,16 +109,27 @@ class RewardScaler(nn.Module):
         clip: float | None = None,
     ) -> None:
         super().__init__()
-        if num_envs <= 0:
-            raise ValueError("num_envs must be positive")
-        if not 0.0 <= gamma <= 1.0:
-            raise ValueError("gamma must be between 0 and 1")
-        if epsilon <= 0:
-            raise ValueError("epsilon must be positive")
+        if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs <= 0:
+            raise ValueError("num_envs must be a positive integer")
+        if (
+            isinstance(gamma, bool)
+            or not isinstance(gamma, Real)
+            or not math.isfinite(gamma)
+            or not 0.0 <= gamma <= 1.0
+        ):
+            raise ValueError("gamma must be finite and between 0 and 1")
+        for name, value in (("epsilon", epsilon), ("clip", clip)):
+            if name == "clip" and value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
         if not isinstance(update_per_step, bool):
             raise TypeError("update_per_step must be boolean")
-        if clip is not None and (not math.isfinite(clip) or clip <= 0):
-            raise ValueError("clip must be finite and positive")
 
         self.gamma = gamma
         self.epsilon = epsilon
@@ -122,6 +157,9 @@ class RewardScaler(nn.Module):
             raise TypeError("rewards must be floating-point tensors")
         if dones.shape != rewards.shape or dones.dtype != torch.bool:
             raise ValueError("dones must be boolean with the same shape as rewards")
+        # Check the entire rollout before advancing any episode accumulator.
+        if not torch.isfinite(rewards).all().item():
+            raise ValueError("rewards must be finite")
 
         if self.update_per_step:
             scaled = torch.empty_like(rewards)

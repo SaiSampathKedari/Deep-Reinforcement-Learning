@@ -1,14 +1,49 @@
-"""Configuration and random-state helpers shared by training workflows."""
+"""Configuration, random-state, and provenance helpers for training workflows."""
 
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+
+from deeprl import __version__
+
+
+def get_provenance() -> dict[str, str | bool | None]:
+    """Return checkpoint-safe versions and best-effort source-checkout details.
+
+    Git is queried only for this package's ``src/deeprl`` checkout, never the
+    caller's working directory or an installed wheel's ancestor repository.
+    Missing checkout metadata, Git failures, and timeouts leave Git fields None.
+    """
+    provenance: dict[str, str | bool | None] = {
+        "deeprl_version": str(__version__),
+        "torch_version": str(torch.__version__),
+        "git_commit": None,
+        "git_dirty": None,
+    }
+    try:
+        package_dir = Path(__file__).resolve().parent
+        root = package_dir.parent.parent
+        if package_dir.parent.name != "src" or not (root / ".git").exists():
+            return provenance
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=root, check=True,
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return provenance
+    provenance.update(git_commit=commit, git_dirty=bool(status))
+    return provenance
 
 
 def _config_json_default(value: Any) -> Any:

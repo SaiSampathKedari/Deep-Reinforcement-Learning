@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
+from numbers import Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -45,13 +47,37 @@ class A2CConfig(OnPolicyConfig):
     critic_optimizer_class  :   type[torch.optim.Optimizer] = torch.optim.Adam
     critic_optimizer_kwargs :   dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Validate finite, nonnegative optimization coefficients."""
+        super().__post_init__()
+
+        for name, value in (
+            ("lr_actor", self.lr_actor),
+            ("lr_critic", self.lr_critic),
+            ("ent_coef", self.ent_coef),
+            ("max_grad_norm", self.max_grad_norm),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not isfinite(value)
+                or value < 0.0
+            ):
+                raise ValueError(
+                    f"{name} must be a finite number >= 0, got {value!r}"
+                )
+
+
 class A2CLearner(OnPolicyLearner):
     """A2C optimizers and algorithm-specific full-rollout update."""
+
+    algorithm_id = "a2c"
+    legacy_algorithm_ids = ("deeprl.algorithms.a2c.A2CLearner",)
 
     mutable_on_resume = OnPolicyLearner.mutable_on_resume | {
         "lr_actor", "lr_critic", "ent_coef",
     }
-    learning_rate_fields = {
+    learning_rate_fields: ClassVar[dict[str, str]] = {
         "lr_actor": "optim_actor",
         "lr_critic": "optim_critic",
     }

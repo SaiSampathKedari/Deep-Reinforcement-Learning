@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
+from numbers import Real
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,9 +36,36 @@ class TRPOConfig(NPGConfig):
     backtrack_coeff :   float = 0.8
     max_backtracks  :   int = 10
 
+    def __post_init__(self) -> None:
+        """Require a contracting backtrack factor and a nonnegative trial count."""
+        super().__post_init__()
+
+        if (
+            isinstance(self.backtrack_coeff, bool)
+            or not isinstance(self.backtrack_coeff, Real)
+            or not isfinite(self.backtrack_coeff)
+            or not 0.0 < self.backtrack_coeff < 1.0
+        ):
+            raise ValueError(
+                "backtrack_coeff must be a finite number strictly between 0 and 1, "
+                f"got {self.backtrack_coeff!r}"
+            )
+        if (
+            isinstance(self.max_backtracks, bool)
+            or not isinstance(self.max_backtracks, int)
+            or self.max_backtracks < 0
+        ):
+            raise ValueError(
+                "max_backtracks must be an integer >= 0, "
+                f"got {self.max_backtracks!r}"
+            )
+
 
 class TRPOLearner(NPGLearner):
     """NPG with backtracking that enforces the sampled KL constraint."""
+
+    algorithm_id = "trpo"
+    legacy_algorithm_ids = ("deeprl.algorithms.trpo.TRPOLearner",)
 
     def __init__(
         self,

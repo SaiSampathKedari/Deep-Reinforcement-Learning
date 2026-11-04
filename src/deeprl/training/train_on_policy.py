@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import warnings
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import torch
 import torch.nn as nn
 from gymnasium.vector import AutoresetMode, VectorEnv
 from gymnasium.spaces import Dict, Tuple
@@ -16,14 +15,17 @@ from deeprl.algorithms.on_policy_base import OnPolicyLearner
 from deeprl.advantages import generalized_advantage_estimate
 from deeprl.buffers import RolloutBuffer
 from deeprl.checkpoint import (
-    CHECKPOINT_FORMAT_VERSION,
-    CHECKPOINT_RESUME_CONTRACT,
+    build_training_checkpoint,
+    get_algorithm_id,
     load_checkpoint,
     save_checkpoint,
+    validate_checkpoint_algorithm,
     validate_training_checkpoint,
 )
 from deeprl.env import to_tensor_data
-from deeprl.lifecycle import config_to_jsonable, get_rng_state, seed_torch, set_rng_state
+from deeprl.lifecycle import (
+    config_to_jsonable, get_provenance, get_rng_state, seed_torch, set_rng_state,
+)
 from deeprl.logger import Logger, MetricHistory
 from deeprl.rollouts import collect_rollout, evaluate_next_values
 from deeprl.stats import TrainingProgress
@@ -131,9 +133,7 @@ def _validate_resume(
 ) -> tuple[TrainingProgress, dict[str, float]]:
     """Check workflow and learner compatibility without loading any state."""
     validate_training_checkpoint(checkpoint, required_keys=("num_envs",))
-    algorithm = f"{type(learner).__module__}.{type(learner).__qualname__}"
-    if checkpoint.get("algorithm", algorithm) != algorithm:
-        raise ValueError("checkpoint algorithm does not match the learner")
+    validate_checkpoint_algorithm(checkpoint, type(learner))
     if checkpoint.get("num_envs", num_envs) != num_envs:
         raise ValueError("checkpoint num_envs does not match the environment")
 
@@ -193,20 +193,20 @@ def _checkpoint_state(
     run_config: dict[str, Any] | None,
     obs_normalizer: RunningNormalizer | None,
     reward_scaler: RewardScaler | None,
+    provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble validated run state without scheduling or writing a checkpoint."""
-    checkpoint = {
-        "format_version": CHECKPOINT_FORMAT_VERSION,
-        "resume_contract": CHECKPOINT_RESUME_CONTRACT,
-        "algorithm": f"{type(learner).__module__}.{type(learner).__qualname__}",
-        "learner_config": learner_config,
-        "num_envs": num_envs,
-        "learner": learner.state_dict(),
-        "config": run_config,
-        "progress": asdict(progress),
-        "rng_state": get_rng_state(device=learner.cfg.device),
-        "preprocessing_config": _preprocessing_config(obs_normalizer, reward_scaler),
-    }
+    checkpoint = build_training_checkpoint(
+        algorithm=get_algorithm_id(type(learner)),
+        learner_state=learner.state_dict(),
+        learner_config=learner_config,
+        run_config=run_config,
+        progress=progress,
+        rng_state=get_rng_state(device=learner.cfg.device),
+        provenance=provenance,
+    )
+    checkpoint["num_envs"] = num_envs
+    checkpoint["preprocessing_config"] = _preprocessing_config(obs_normalizer, reward_scaler)
     if reward_scaler is not None:
         checkpoint["reward_scaler"] = reward_scaler.state_dict()
     if learner.cfg.normalize_observations_during_collection:
@@ -289,6 +289,7 @@ def train_on_policy(
             run_config = checkpoint.get("config")
     if run_config is not None:
         run_config = config_to_jsonable(run_config)
+    provenance = get_provenance() if checkpoint_dir is not None else None
 
     # Native state loaders place tensors on the already-constructed components.
     seed_torch(cfg.seed)
@@ -466,6 +467,7 @@ def train_on_policy(
                     run_config=run_config,
                     obs_normalizer=obs_normalizer,
                     reward_scaler=reward_scaler,
+                    provenance=provenance,
                 )
                 save_checkpoint(checkpoint_dir / "last.pt", checkpoint)
 

@@ -42,6 +42,8 @@ dev = ["pytest", "ipykernel"]
 # repos cloned into external/ (cleanrl, spinningup, sb3, AgileRL).
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Environment examples are checkout modules outside the installed src package.
+pythonpath = ["."]
 
 # CUDA-enabled PyTorch on Linux and Windows; use PyPI on other platforms.
 [[tool.uv.index]]

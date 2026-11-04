@@ -46,7 +46,11 @@ normalized, without subtracting a mean.
 - Reward accumulators reset **after** including the final reward at either episode
   boundary. Our running moments start without Gymnasium's small pseudocount.
 - Disabled autoreset records true final observations before partial resets. Only
-  newly reset observations update moments again; continuing states are not recounted.
+  newly reset observations update moments again and are normalized again.
+  Continuing states keep their stored normalized representation, so bootstrap
+  and next-current value inputs remain consistent. This corrects the earlier
+  full-batch re-normalization after partial resets; older checkpoints can load,
+  but continuation now uses the corrected collection behavior.
 - Evaluation uses separate fixed seeds and frozen observation statistics. The
   12.288M budget extends the reference's 10M budget; one seed is not its four-seed study.
 

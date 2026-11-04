@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from math import isfinite
+from numbers import Real
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
 
+from deeprl import learner_state
 from deeprl.buffers import RolloutBuffer
 from deeprl.stats import TrainingStats
 
@@ -49,9 +52,14 @@ class OnPolicyConfig:
             ("gamma", self.gamma),
             ("gae_lambda", self.gae_lambda),
         ):
-            if not 0.0 <= value <= 1.0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not isfinite(value)
+                or not 0.0 <= value <= 1.0
+            ):
                 raise ValueError(
-                    f"{name} must be between 0 and 1, got {value!r}"
+                    f"{name} must be a finite number between 0 and 1, got {value!r}"
                 )
     
 
@@ -60,10 +68,10 @@ class OnPolicyLearner(ABC):
     """On-policy update, named state, and resume-compatibility contract."""
     
     mutable_on_resume = frozenset({"total_timesteps", "device", "log_every"})
-    resume_defaults: dict[str, Any] = {
+    resume_defaults: ClassVar[dict[str, Any]] = {
         "normalize_observations_during_collection": False,
     }
-    learning_rate_fields: dict[str, str] = {}
+    learning_rate_fields: ClassVar[dict[str, str]] = {}
 
     def __init__(
         self,
@@ -93,34 +101,17 @@ class OnPolicyLearner(ABC):
         """Return optimizer state; manual-update learners may return none."""
         return {}
     
-    def _state_objects(self) -> dict[str, nn.Module | torch.optim.Optimizer]:
-        modules = self.modules_by_role
-        optimizers = self.optimizers_by_role
-        
-        if modules.keys() & optimizers.keys():
-            raise ValueError("module and optimizer state keys must be distinct")
-        return {**modules, **optimizers}
-    
-    
     def state_dict(self) -> dict[str, Any]:
         """Return named module and optimizer states using the existing flat layout."""
-        return {
-            name: component.state_dict()
-            for name, component in self._state_objects().items()
-        }
+        return learner_state.learner_state_dict(
+            self.modules_by_role, self.optimizers_by_role
+        )
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         """Check component names before restoring modules and optimizers."""
-        components = self._state_objects()
-        missing = components.keys() - state.keys()
-        unexpected = state.keys() - components.keys()
-        if missing or unexpected:
-            raise ValueError(
-                f"checkpoint learner state differs: missing={sorted(missing)}, "
-                f"unexpected={sorted(unexpected)}"
-            )
-        for name, component in components.items():
-            component.load_state_dict(state[name])
+        learner_state.load_learner_state_dict(
+            state, self.modules_by_role, self.optimizers_by_role
+        )
     
     def validate_resume_config(
         self,
@@ -128,26 +119,17 @@ class OnPolicyLearner(ABC):
         current_config: dict[str, Any],
     ) -> dict[str, float]:
         """Validate configuration and return changed learning rates by optimizer role."""
-        changed = [
-            name for name, value in current_config.items()
-            if name not in self.mutable_on_resume
-            and saved_config.get(name, self.resume_defaults.get(name)) != value
-        ]
-        if changed:
-            raise ValueError(f"checkpoint learner config differs: {', '.join(changed)}")
-
-        return {
-            role: current_config[name]
-            for name, role in self.learning_rate_fields.items()
-            if name in saved_config and saved_config[name] != current_config[name]
-        }
+        return learner_state.validate_resume_config(
+            saved_config,
+            current_config,
+            mutable_on_resume=self.mutable_on_resume,
+            resume_defaults=self.resume_defaults,
+            learning_rate_fields=self.learning_rate_fields,
+        )
 
     def apply_resume_overrides(self, learning_rates: dict[str, float]) -> None:
         """Apply configured learning-rate changes after restoring optimizer state."""
-        optimizers = self.optimizers_by_role
-        for role, learning_rate in learning_rates.items():
-            for group in optimizers[role].param_groups:
-                group["lr"] = learning_rate
+        learner_state.apply_resume_overrides(learning_rates, self.optimizers_by_role)
 
     @abstractmethod
     def update(

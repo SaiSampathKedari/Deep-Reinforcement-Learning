@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
+from math import isfinite
+from numbers import Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -125,12 +127,51 @@ class NPGConfig(OnPolicyConfig):
     critic_optimizer_class  :   type[torch.optim.Optimizer] = torch.optim.Adam
     critic_optimizer_kwargs :   dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Validate natural-gradient coefficients and optional minibatching."""
+        super().__post_init__()
+
+        for name, value in (
+            ("lr_critic", self.lr_critic),
+            ("max_kl", self.max_kl),
+            ("cg_damping", self.cg_damping),
+            ("cg_residual_tol", self.cg_residual_tol),
+            ("max_grad_norm", self.max_grad_norm),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not isfinite(value)
+                or value < 0.0
+            ):
+                raise ValueError(
+                    f"{name} must be a finite number >= 0, got {value!r}"
+                )
+
+        for name, value, minimum in (
+            ("cg_iters", self.cg_iters, 0),
+            ("batch_size", self.batch_size, 1),
+        ):
+            if name == "batch_size" and value is None:
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < minimum
+            ):
+                raise ValueError(
+                    f"{name} must be an integer >= {minimum}, got {value!r}"
+                )
+
 
 class NPGLearner(OnPolicyLearner):
     """Natural policy-gradient and critic updates."""
 
+    algorithm_id = "npg"
+    legacy_algorithm_ids = ("deeprl.algorithms.npg.NPGLearner",)
+
     mutable_on_resume = OnPolicyLearner.mutable_on_resume | {"lr_critic"}
-    learning_rate_fields = {"lr_critic": "optim_critic"}
+    learning_rate_fields: ClassVar[dict[str, str]] = {"lr_critic": "optim_critic"}
 
     def __init__(
         self,
