@@ -4,6 +4,8 @@ Version 1 keeps the flat payload: learner, progress, algorithm, learner_config,
 config, rng_state, format_version, and resume_contract. Workflows declare any
 additional required keys; on-policy training requires num_envs. Optional
 obs_normalizer and reward_scaler entries hold component state dictionaries.
+Optional preprocessing_config records their non-tensor constructor settings;
+older checkpoints without it retain the same format version.
 
 The only supported resume contract is "continue": restore supported learning
 state, not an exact uninterrupted trajectory. The on-policy trainer starts
@@ -88,6 +90,16 @@ def validate_training_checkpoint(
     for name in ("obs_normalizer", "reward_scaler"):
         if name in checkpoint and not isinstance(checkpoint[name], Mapping):
             raise ValueError(f"checkpoint {name} must be a state mapping")
+
+    if "preprocessing_config" in checkpoint:
+        preprocessing = checkpoint["preprocessing_config"]
+        if not isinstance(preprocessing, Mapping) or set(preprocessing) != {
+            "observation", "reward",
+        }:
+            raise ValueError("checkpoint preprocessing_config must contain observation and reward")
+        for name, settings in preprocessing.items():
+            if settings is not None and not isinstance(settings, Mapping):
+                raise ValueError(f"checkpoint preprocessing_config {name} must be a mapping or None")
 
     rng_state = checkpoint.get("rng_state")
     if version or rng_state is not None:

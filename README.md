@@ -72,12 +72,19 @@ For a runnable CPU example with checkpoints, evaluation, videos, and learning
 curves, see [PPO on CartPole](examples/gymnasium/cartpole/README.md). Its settings
 and networks are separate from the PPO implementation.
 
+The shared rollout trainer lives in [training/train_on_policy.py](src/deeprl/training/train_on_policy.py),
+and the learner contract lives in [algorithms/on_policy_base.py](src/deeprl/algorithms/on_policy_base.py).
+Algorithm files own the learner updates. Import the trainer from
+`deeprl.training.train_on_policy`; the old `deeprl.training.on_policy` and
+`deeprl.algorithms.on_policy` modules are compatibility-only re-export shims.
+The [one-step CartPole tutorial](examples/gymnasium/cartpole/run_cartpole_one_step_actor_critic.py)
+is a separate educational loop that exports inference weights, without resume support.
+
 ## Roadmap
 
-**Now:** DQN, Double DQN, and the shared replay and Q-learning system.
+**Now:** Finish shared training lifecycle cleanup, then implement DQN and Double DQN.
 
-**Next:** Reusable policy, value, and Q-function interfaces; configurable
-optimizers; DDPG, TD3, SAC; and multi-seed Gymnasium and MuJoCo benchmarks.
+**Next:** DDPG, TD3, SAC, and multi-seed Gymnasium and MuJoCo benchmarks.
 
 **Later:** Offline RL, imitation learning, model-based RL, richer policy
 architectures, real-robot deployment, and VLA post-training.

@@ -16,9 +16,9 @@ from deeprl.algorithms.npg import (
     NPGLearner,
     _set_flat_parameters,
 )
-from deeprl.algorithms.on_policy import train_on_policy
 from deeprl.buffers import RolloutBatch
 from deeprl.logger import Logger, MetricHistory
+from deeprl.training.train_on_policy import train_on_policy
 
 if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter

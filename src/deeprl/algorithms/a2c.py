@@ -11,14 +11,14 @@ import torch.nn as nn
 from gymnasium.vector import VectorEnv
 from torch.distributions import Distribution
 
-from deeprl.algorithms.on_policy import (
+from deeprl.algorithms.on_policy_base import (
     OnPolicyConfig,
     OnPolicyLearner,
-    train_on_policy,
 )
 from deeprl.buffers import RolloutBuffer
 from deeprl.logger import Logger, MetricHistory
 from deeprl.stats import TrainingStats
+from deeprl.training.train_on_policy import train_on_policy
 from deeprl.utils import explained_variance
 
 if TYPE_CHECKING:

@@ -14,26 +14,25 @@ dependencies = [
     "torch",
     # The [torch] extra brings array_api_compat, which gymnasium.wrappers
     # NumpyToTorch imports lazily -- without it the wrapper raises a bare
-    # ModuleNotFoundError. See docs/implementation_standards.md, section 2.
+    # ModuleNotFoundError.
     "gymnasium[torch]",
     "matplotlib",
-    "pyyaml",  # experiment configs (section 11)
+    "pyyaml",
     "tqdm",
     "tensordict>=0.14.1",
 ]
 
-# numpy and scipy are deliberately absent: this package never imports numpy
-# (section 1), and the bootstrap CI removed the only use scipy had (section 9).
+# numpy and scipy are deliberately absent: package computation uses Torch,
+# including the bootstrap confidence intervals.
 # numpy still arrives transitively via gymnasium and matplotlib.
 
 [project.optional-dependencies]
-# runs/<run_name>/metrics.jsonl is the source of truth for everything reported
-# (section 11). TensorBoard is a viewer for watching long runs live; it costs
-# grpcio + protobuf + werkzeug, so it is opt-in until step 6.
+# Examples persist scalar metrics in metrics.jsonl. TensorBoard is an optional
+# viewer for those training metrics.
 tb = ["tensorboard"]
 # classic-control brings pygame-ce (rendering); other brings moviepy (mp4 writing).
 video = ["gymnasium[classic-control,other]"]
-box2d = ["gymnasium[box2d]"]    # LunarLander, BipedalWalker -- step 7, needs system swig
+box2d = ["gymnasium[box2d]"]    # LunarLander and BipedalWalker; needs system swig.
 mujoco = ["gymnasium[mujoco]>=1.4.0"]  # Camera controls support MuJoCo 3.11+.
 
 [dependency-groups]

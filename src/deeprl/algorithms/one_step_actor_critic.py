@@ -1,4 +1,8 @@
-"""One-step actor-critic with vectorized environment updates."""
+"""Pedagogical one-step actor-critic with vectorized environment updates.
+
+This explicit reference loop does not implement the rollout trainer's
+normalization, checkpoint, or resume lifecycle.
+"""
 
 from __future__ import annotations
 

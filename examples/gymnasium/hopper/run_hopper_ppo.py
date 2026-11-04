@@ -13,7 +13,7 @@ from gymnasium.wrappers.vector import NumpyToTorch
 from torch import nn
 from torch.utils.tensorboard import SummaryWriter
 
-from deeprl.algorithms.on_policy import train_on_policy
+from deeprl.training.train_on_policy import train_on_policy
 from deeprl.algorithms.ppo import PPOLearner
 from deeprl.checkpoint import load_checkpoint
 from deeprl.evaluate import Evaluator
