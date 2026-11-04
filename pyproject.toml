@@ -34,7 +34,7 @@ tb = ["tensorboard"]
 # classic-control brings pygame-ce (rendering); other brings moviepy (mp4 writing).
 video = ["gymnasium[classic-control,other]"]
 box2d = ["gymnasium[box2d]"]    # LunarLander, BipedalWalker -- step 7, needs system swig
-mujoco = ["gymnasium[mujoco]"]  # HalfCheetah, Hopper, Reacher -- step 9
+mujoco = ["gymnasium[mujoco]>=1.4.0"]  # Camera controls support MuJoCo 3.11+.
 
 [dependency-groups]
 dev = ["pytest", "ipykernel"]
@@ -44,16 +44,16 @@ dev = ["pytest", "ipykernel"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-# CPU-only torch until DQN-on-Atari (section 13). Nothing through PPO benefits
-# from CUDA, and the default wheel bundles it at ~2.5-3 GB. Delete both blocks
-# below to switch to the CUDA build, then `uv lock --upgrade-package torch`.
+# CUDA-enabled PyTorch on Linux and Windows; use PyPI on other platforms.
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cpu" }]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
