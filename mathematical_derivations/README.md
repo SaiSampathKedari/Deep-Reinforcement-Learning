@@ -36,7 +36,7 @@ the subsequent algorithms.
 |---|---|---|
 | 21 | [Natural Policy Gradient](21_Natural-Policy-Gradient.pdf) | 18 |
 | 22 | [Trust Region Policy Optimization](22_Trust-Region-Policy-Optimization.pdf) | 19 |
-| 23 | **Proximal Policy Optimization — derivation in progress** | 20 (reserved) |
+| 23 | [Proximal Policy Optimization](23_Proximal-Policy-Optimization.pdf) | 20 |
 | 24 | [Deep Q-Network](24_Deep-Q-Network.pdf) | 21 |
 | 25 | [Double DQN](25_Double-DQN.pdf) | 22 |
 | 26 | [Deterministic Policy Gradient](26_Deterministic-Policy-Gradient.pdf) | 23 |
