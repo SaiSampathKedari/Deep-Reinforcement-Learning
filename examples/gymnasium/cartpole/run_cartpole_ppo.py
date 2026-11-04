@@ -3,7 +3,7 @@
 import argparse
 import json
 from contextlib import ExitStack
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 
 import gymnasium as gym
@@ -15,6 +15,7 @@ from deeprl.algorithms.ppo import PPOLearner
 from deeprl.checkpoint import load_checkpoint
 from deeprl.env import make_vec_env
 from deeprl.evaluate import Evaluator
+from deeprl.lifecycle import config_to_jsonable, seed_torch, validate_run_config
 from deeprl.logger import Logger
 from deeprl.policies import CategoricalPolicy
 from deeprl.value import ValueFunction
@@ -60,17 +61,14 @@ def main() -> None:
     # The shared trainer checks learner settings and restores training state.
     if args.resume_from:
         saved_config = load_checkpoint(args.resume_from)["config"]
-        for name in ("env_id", "policy_hidden_sizes", "value_hidden_sizes"):
-            if saved_config[name] != run_config[name]:
-                raise ValueError(f"Checkpoint {name} does not match this experiment.")
+        validate_run_config(
+            saved_config,
+            run_config,
+            keys=("env_id", "policy_hidden_sizes", "value_hidden_sizes"),
+        )
 
     # Record resolved settings using plain names for Python classes and devices.
-    learner_config = asdict(cfg)
-    for name, value in learner_config.items():
-        if isinstance(value, type):
-            learner_config[name] = f"{value.__module__}.{value.__qualname__}"
-        elif isinstance(value, torch.device):
-            learner_config[name] = str(value)
+    learner_config = config_to_jsonable(cfg)
 
     # Require a fresh directory so an earlier run cannot be overwritten.
     args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -84,7 +82,7 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    torch.manual_seed(cfg.seed)  # Seed before initializing network weights.
+    seed_torch(cfg.seed)  # Seed before initializing network weights.
 
     # Close environments and flush logging even if training raises an exception.
     with ExitStack() as stack:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 from gymnasium.vector import VectorEnv
@@ -9,6 +11,9 @@ from torch.distributions import Distribution
 
 from deeprl.buffers import RolloutBuffer, TensorData
 from deeprl.env import from_tensor_data, to_tensor_data
+
+if TYPE_CHECKING:
+    from deeprl.normalization import RunningNormalizer
 
 
 @torch.no_grad()
@@ -18,6 +23,7 @@ def collect_rollout(
     value_fn        :   nn.Module,
     buffer          :   RolloutBuffer,
     observations    :   TensorData | dict | tuple,
+    obs_normalizer  :   RunningNormalizer | None = None,
 ) -> TensorData:
     """Collect one T-step rollout from N vectorized environments.
 
@@ -26,6 +32,10 @@ def collect_rollout(
     Dict/Tuple observations are represented by nested TensorDicts with batch
     size (N,). Network outputs are stored without autograd graphs. Collection
     requires NumpyToTorch and AutoresetMode.DISABLED.
+
+    With an external obs_normalizer, incoming observations must already be
+    normalized. New observations update its statistics before normalization;
+    the buffer and returned observations contain the normalized policy inputs.
     """
 
     # Restart writing at the first row of the preallocated rollout storage.
@@ -33,6 +43,9 @@ def collect_rollout(
     observations = to_tensor_data(observations, batch_size=envs.num_envs)
 
     for _ in range(buffer.rollout_steps):
+        
+        # Preserve current observations before the environment reuses its storage.
+        observations = observations.clone()
 
         # --------------------------------------------------------------
         # 1. Current-state evaluation
@@ -64,6 +77,9 @@ def collect_rollout(
         env_actions = from_tensor_data(actions, envs.single_action_space)
         next_observations, rewards, terminations, truncations, _ = envs.step(env_actions)
         next_observations = to_tensor_data(next_observations, batch_size=envs.num_envs)
+        if obs_normalizer is not None:
+            obs_normalizer.update(next_observations)
+            next_observations = obs_normalizer(next_observations)
 
         # --------------------------------------------------------------
         # 3. Transition storage
@@ -98,6 +114,11 @@ def collect_rollout(
             # observations for continuing environments.
             observations, _ = envs.reset(options={"reset_mask":dones})
             observations = to_tensor_data(observations, batch_size=envs.num_envs)
+            if obs_normalizer is not None:
+                # Only reset entries are new samples; continuing observations
+                # were already included by the preceding environment step.
+                obs_normalizer.update(observations[dones])
+                observations = obs_normalizer(observations)
 
         else:
 

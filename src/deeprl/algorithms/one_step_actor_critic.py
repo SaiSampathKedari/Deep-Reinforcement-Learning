@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -11,8 +11,9 @@ from gymnasium.vector import AutoresetMode, VectorEnv
 from torch.distributions import Distribution
 
 from deeprl.env import from_tensor_data, to_tensor_data
+from deeprl.lifecycle import seed_torch
 from deeprl.logger import Logger, MetricHistory
-from deeprl.stats import TrainingStats
+from deeprl.stats import TrainingProgress, TrainingStats
 from deeprl.utils import grad_norm
 
 if TYPE_CHECKING:
@@ -64,6 +65,12 @@ def one_step_actor_critic(
     # Setup
     # ------------------------------------------------------------------
 
+    if logger is not None:
+        if logger.num_envs != envs.num_envs:
+            raise ValueError("logger num_envs must match the environment")
+        if logger.global_step != 0 or logger.gradient_step != 0:
+            raise ValueError("a new run requires a fresh logger")
+
     # Use a distinct explained-variance metric for one-step TD targets.
     owns_logger = logger is None
     if logger is None:
@@ -76,6 +83,7 @@ def one_step_actor_critic(
         )
     logger.log_hyperparameters(cfg)
 
+    seed_torch(cfg.seed)
     policy   = policy.to(device=cfg.device)
     value_fn = value_fn.to(device=cfg.device)
 
@@ -101,8 +109,12 @@ def one_step_actor_critic(
     discounts = torch.ones(envs.num_envs, device=cfg.device)
 
     num_vector_steps = cfg.total_timesteps // envs.num_envs
+    progress = TrainingProgress()
 
     for _ in range(num_vector_steps):
+        
+        # Preserve network inputs through environment stepping and backpropagation.
+        obs = obs.clone()
 
         # --------------------------------------------------------------
         # 1. Policy forward pass
@@ -137,6 +149,7 @@ def one_step_actor_critic(
         next_obs, rewards, terminations, truncations, _ = envs.step(
             from_tensor_data(actions, envs.single_action_space)
         )
+        progress = replace(progress, global_step=progress.global_step + envs.num_envs)
         next_obs = to_tensor_data(next_obs, batch_size=envs.num_envs, device=cfg.device)
 
         # Each environment episode finishes through either termination
@@ -212,8 +225,14 @@ def one_step_actor_critic(
         logger.log_step(
             rewards,
             dones,
+            progress=progress,
             values=values,
             targets=td_targets,
+        )
+        progress = replace(
+            progress,
+            gradient_step=progress.gradient_step + 1,
+            update=progress.update + 1,
         )
         logger.log_update(
             TrainingStats(
@@ -230,11 +249,12 @@ def one_step_actor_critic(
                     "charts/value_learning_rate": optim_critic.param_groups[0]["lr"],
                 },
                 gradient_steps=1,
-            )
+            ),
+            progress=progress,
         )
         logger.maybe_dump()
         if evaluator is not None:
-            evaluator.maybe_evaluate(policy, logger)
+            evaluator.maybe_evaluate(policy, logger, progress=progress)
 
         # --------------------------------------------------------------
         # 6. Update discounts
@@ -268,7 +288,7 @@ def one_step_actor_critic(
             obs = next_obs
 
     if evaluator is not None:
-        evaluator.evaluate_now(policy, logger)
+        evaluator.evaluate_now(policy, logger, progress=progress)
 
     # Flush the final partial interval only when this function owns the logger.
     return logger.finish() if owns_logger else logger.history

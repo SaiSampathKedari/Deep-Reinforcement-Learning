@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Literal
 
 import gymnasium as gym
 import torch
@@ -14,6 +15,7 @@ from torch.distributions import Distribution
 from deeprl.buffers import TensorData
 from deeprl.env import from_tensor_data, to_tensor_data
 from deeprl.logger import Logger
+from deeprl.stats import TrainingProgress
 
 
 def _evaluation_action(
@@ -21,6 +23,10 @@ def _evaluation_action(
     *,
     deterministic: bool,
 ) -> TensorData:
+    if torch.is_tensor(distribution):
+        raise TypeError(
+            "tensor-valued actors and Q-functions require an explicit action_fn"
+        )
     if not deterministic:
         return distribution.sample()
     try:
@@ -38,14 +44,23 @@ def evaluate_policy(
     device: torch.device,
     deterministic: bool,
     seed: int,
+    action_fn: Callable[[TensorData, bool], TensorData] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run complete evaluation episodes without changing training RNG state."""
+    """Evaluate episodes while preserving default CPU/selected-CUDA Torch RNG.
+
+    By default, policy returns a distribution. An explicit action_fn instead
+    receives (batched_observations, deterministic) and returns batched actions.
+    It must use policy or its submodules so evaluation mode is managed here.
+    Python, NumPy, and custom generator state are outside this RNG guarantee.
+    """
     if num_episodes <= 0:
         raise ValueError(f"num_episodes must be positive, got {num_episodes}")
 
     returns = torch.empty(num_episodes, dtype=torch.float32)
     lengths = torch.empty(num_episodes, dtype=torch.int64)
-    was_training = policy.training
+    training_modes = [
+        (module, module.training) for module in policy.modules()
+    ]
     policy.eval()
 
     try:
@@ -60,7 +75,13 @@ def evaluate_policy(
             )
 
         with torch.random.fork_rng(devices=fork_devices):
-            torch.manual_seed(seed)
+            
+            # Seed only the generators restored by this evaluation context.
+            torch.random.default_generator.manual_seed(seed)
+            if fork_devices:
+                with torch.cuda.device(fork_devices[0]):
+                    torch.cuda.manual_seed(seed)
+                    
             for episode in range(num_episodes):
                 observation, _ = env.reset(seed=seed + episode)
                 episode_return = 0.0
@@ -69,12 +90,17 @@ def evaluate_policy(
 
                 while not done:
                     observation_tensor = to_tensor_data(observation, device=device)
-                    distribution: Distribution = policy(observation_tensor)
-                    action = _evaluation_action(
-                        distribution,
-                        deterministic=deterministic,
-                    )
-                    action = to_tensor_data(action, batch_size=1)[0]
+                    if action_fn is None:
+                        action = _evaluation_action(
+                            policy(observation_tensor),
+                            deterministic=deterministic,
+                        )
+                    else:
+                        action = action_fn(observation_tensor, deterministic)
+                    action = to_tensor_data(action, batch_size=1)
+                    if len(action.shape) == 0 or action.shape[0] != 1:
+                        raise ValueError("evaluation actions must have leading batch dimension 1")
+                    action = action[0]
                     env_action = from_tensor_data(action, env.action_space, numpy=True)
 
                     observation, reward, terminated, truncated, _ = env.step(env_action)
@@ -85,13 +111,14 @@ def evaluate_policy(
                 returns[episode] = episode_return
                 lengths[episode] = episode_length
     finally:
-        policy.train(was_training)
+        for module, was_training in training_modes:
+            module.training = was_training
 
     return returns, lengths
 
 
 class Evaluator:
-    """Run deterministic and stochastic evaluations on an env-step schedule."""
+    """Run selected action modes on an environment-step schedule."""
 
     def __init__(
         self,
@@ -101,17 +128,32 @@ class Evaluator:
         num_episodes: int,
         device: torch.device,
         seed: int,
+        action_fn: Callable[[TensorData, bool], TensorData] | None = None,
+        modes: Sequence[Literal["deterministic", "stochastic"]] = (
+            "deterministic", "stochastic",
+        ),
     ) -> None:
         if eval_every <= 0:
             raise ValueError(f"eval_every must be positive, got {eval_every}")
         if num_episodes <= 0:
             raise ValueError(f"num_episodes must be positive, got {num_episodes}")
+        if isinstance(modes, str):
+            raise ValueError("modes must be a sequence of evaluation mode names")
+        modes = tuple(modes)
+        if (
+            not modes
+            or any(mode not in ("deterministic", "stochastic") for mode in modes)
+            or len(set(modes)) != len(modes)
+        ):
+            raise ValueError("modes must contain unique deterministic/stochastic names")
 
         self.env = env
         self.eval_every = eval_every
         self.num_episodes = num_episodes
         self.device = device
         self.seed = seed
+        self.action_fn = action_fn
+        self.modes = modes
         self._next_eval_step = eval_every
         self._last_eval_step: int | None = None
 
@@ -120,8 +162,11 @@ class Evaluator:
         self._next_eval_step = (global_step // self.eval_every + 1) * self.eval_every
         self._last_eval_step = None
 
-    def _evaluate(self, policy: nn.Module, logger: Logger) -> None:
-        for deterministic in (True, False):
+    def _evaluate(
+        self, policy: nn.Module, logger: Logger, *, progress: TrainingProgress
+    ) -> None:
+        for mode in self.modes:
+            deterministic = mode == "deterministic"
             returns, lengths = evaluate_policy(
                 self.env,
                 policy,
@@ -129,28 +174,34 @@ class Evaluator:
                 device=self.device,
                 deterministic=deterministic,
                 seed=self.seed,
+                action_fn=self.action_fn,
             )
             logger.log_evaluation(
                 returns,
                 lengths,
+                progress=progress,
                 deterministic=deterministic,
             )
-        self._last_eval_step = logger.global_step
+        self._last_eval_step = progress.global_step
 
-    def maybe_evaluate(self, policy: nn.Module, logger: Logger) -> None:
+    def maybe_evaluate(
+        self, policy: nn.Module, logger: Logger, *, progress: TrainingProgress
+    ) -> None:
         """Evaluate once after crossing one or more scheduled checkpoints."""
-        if logger.global_step < self._next_eval_step:
+        if progress.global_step < self._next_eval_step:
             return
 
-        self._evaluate(policy, logger)
+        self._evaluate(policy, logger, progress=progress)
 
-        while self._next_eval_step <= logger.global_step:
+        while self._next_eval_step <= progress.global_step:
             self._next_eval_step += self.eval_every
 
-    def evaluate_now(self, policy: nn.Module, logger: Logger) -> None:
+    def evaluate_now(
+        self, policy: nn.Module, logger: Logger, *, progress: TrainingProgress
+    ) -> None:
         """Evaluate the final policy unless it was evaluated at this step."""
-        if self._last_eval_step != logger.global_step:
-            self._evaluate(policy, logger)
+        if self._last_eval_step != progress.global_step:
+            self._evaluate(policy, logger, progress=progress)
 
 
 def load_metric_curve(

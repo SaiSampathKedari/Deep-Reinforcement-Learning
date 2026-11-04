@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 from gymnasium.vector import VectorEnv
-from torch.distributions import Distribution
+from torch.distributions import Distribution, Independent, Normal
 
 from deeprl.algorithms.on_policy import (
     OnPolicyConfig,
@@ -18,6 +18,7 @@ from deeprl.algorithms.on_policy import (
 )
 from deeprl.buffers import RolloutBuffer
 from deeprl.logger import Logger, MetricHistory
+from deeprl.normalization import RunningNormalizer
 from deeprl.stats import TrainingStats
 from deeprl.utils import explained_variance
 
@@ -25,11 +26,12 @@ if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter
 
     from deeprl.evaluate import Evaluator
-
+    from deeprl.normalization import RewardScaler
 
 @dataclass(frozen=True)
 class PPOConfig(OnPolicyConfig):
     """Optimization hyperparameters specific to PPO-Clip."""
+    
 
     # Optimization
     lr_critic           :   float        = 3e-4
@@ -43,6 +45,9 @@ class PPOConfig(OnPolicyConfig):
     value_clip_range    :   float | None = None
     ent_coef            :   float        = 0.0
     normalize_advantage :   bool         = True
+    normalize_advantage_per_minibatch: bool = False
+    normalize_value_targets: bool = False
+    log_ratio_clip      :   float | None = None
 
     # Optional policy-KL early stopping
     target_kl           :   float | None = None
@@ -53,43 +58,88 @@ class PPOConfig(OnPolicyConfig):
     critic_optimizer_class  :   type[torch.optim.Optimizer] = torch.optim.Adam
     critic_optimizer_kwargs :   dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """Validate PPO minibatch and epoch counts."""
+        super().__post_init__()
+        
+        for name, value in (
+            ("batch_size", self.batch_size),
+            ("update_epochs", self.update_epochs),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 1
+            ):
+                raise ValueError(
+                    f"{name} must be a positive integer, got {value!r}"
+                )
 
 class PPOLearner(OnPolicyLearner):
     """PPO-Clip optimizers and multi-epoch minibatch update."""
 
+    mutable_on_resume = OnPolicyLearner.mutable_on_resume | {
+        "lr_actor", "lr_critic", "ent_coef", "target_kl", "batch_size",
+    }
+    resume_defaults = {
+        **OnPolicyLearner.resume_defaults,
+        "normalize_advantage_per_minibatch": False,
+        "normalize_value_targets": False,
+    }
+    learning_rate_fields = {
+        "lr_actor": "optim_actor",
+        "lr_critic": "optim_critic",
+    }
+    
     def __init__(
         self,
         policy      :   nn.Module,
         value_fn    :   nn.Module,
         cfg         :   PPOConfig,
     ) -> None:
+        if cfg.normalize_value_targets and cfg.value_clip_range is not None:
+            raise ValueError("value-target normalization cannot be combined with value clipping")
         super().__init__(policy, value_fn, cfg)
         self.cfg: PPOConfig = cfg
-
-        # Construct optimizers after the networks are moved to their device.
-        self.optim_actor = cfg.actor_optimizer_class(
+        self.value_target_stats = (
+            RunningNormalizer((), clip=None).to(cfg.device)
+            if cfg.normalize_value_targets else None
+        )
+        self.configure_optimizers()
+    
+    def configure_optimizers(self) -> None:
+        """Construct optimizers once, after network device placement."""
+        if hasattr(self, "optim_actor") or hasattr(self, "optim_critic"):
+            raise RuntimeError("optimizers are already configured")
+        self.optim_actor = self.cfg.actor_optimizer_class(
             self.policy.parameters(),
-            lr=cfg.lr_actor,
-            **cfg.actor_optimizer_kwargs,
+            lr=self.cfg.lr_actor,
+            **self.cfg.actor_optimizer_kwargs,
         )
-        self.optim_critic = cfg.critic_optimizer_class(
+        self.optim_critic = self.cfg.critic_optimizer_class(
             self.value_fn.parameters(),
-            lr=cfg.lr_critic,
-            **cfg.critic_optimizer_kwargs,
+            lr=self.cfg.lr_critic,
+            **self.cfg.critic_optimizer_kwargs,
         )
-
-    def state_dict(self) -> dict[str, Any]:
-        """Return network and optimizer states."""
-        state = super().state_dict()
-        state["optim_actor"] = self.optim_actor.state_dict()
-        state["optim_critic"] = self.optim_critic.state_dict()
-        return state
+    
+    @property
+    def modules_by_role(self) -> dict[str, nn.Module]:
+        """Include optional value-target statistics in learner state."""
+        modules = super().modules_by_role
+        if self.value_target_stats is not None:
+            modules["value_target_stats"] = self.value_target_stats
+        return modules
+    
+    @property
+    def optimizers_by_role(self) -> dict[str, torch.optim.Optimizer]:
+        """Return actor and critic optimizers under their existing state keys."""
+        return {"optim_actor": self.optim_actor, "optim_critic": self.optim_critic}
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         """Restore network and optimizer states."""
+        if (self.value_target_stats is not None) != ("value_target_stats" in state):
+            raise ValueError("checkpoint value-target normalization does not match the learner")
         super().load_state_dict(state)
-        self.optim_actor.load_state_dict(state["optim_actor"])
-        self.optim_critic.load_state_dict(state["optim_critic"])
 
     def update(
         self,
@@ -108,22 +158,29 @@ class PPOLearner(OnPolicyLearner):
         self.policy.train()
         self.value_fn.train()
 
-        # Accumulate sample-weighted metrics over all accepted minibatch updates.
-        metric_sums: dict[str, float] = {
-            "losses/policy_loss": 0.0,
-            "losses/value_loss": 0.0,
-            "diagnostics/entropy": 0.0,
-            "diagnostics/approximate_kl": 0.0,
-            "diagnostics/clip_fraction": 0.0,
-            "grads/policy_norm": 0.0,
-            "grads/value_norm": 0.0,
-        }
+        # Accumulate sample-weighted metrics on device across accepted updates.
+        metric_names = (
+            "losses/policy_loss",
+            "losses/value_loss",
+            "diagnostics/entropy",
+            "diagnostics/approximate_kl",
+            "diagnostics/clip_fraction",
+            "grads/policy_norm",
+            "grads/value_norm",
+        )
+        metric_sums = torch.zeros(
+            len(metric_names), dtype=advantages.dtype, device=self.cfg.device
+        )
         num_samples = 0
         gradient_steps = 0
 
         # Normalize once over the complete rollout so every epoch uses the same
         # fixed advantage weights and normalization statistics.
-        if self.cfg.normalize_advantage and advantages.numel() > 1:
+        if (
+            self.cfg.normalize_advantage
+            and not self.cfg.normalize_advantage_per_minibatch
+            and advantages.numel() > 1
+        ):
             advantages = (
                 advantages - advantages.mean()
             ) / (advantages.std(unbiased=False) + 1e-8)
@@ -151,6 +208,15 @@ class PPOLearner(OnPolicyLearner):
                 action_distributions: Distribution = self.policy(batch.observations)
                 log_probs: torch.Tensor = action_distributions.log_prob(batch.actions)
                 values: torch.Tensor = self.value_fn(batch.observations)
+                batch_advantages = batch.advantages
+                if (
+                    self.cfg.normalize_advantage
+                    and self.cfg.normalize_advantage_per_minibatch
+                    and batch_advantages.numel() > 1
+                ):
+                    batch_advantages = (
+                        batch_advantages - batch_advantages.mean()
+                    ) / (batch_advantages.std(correction=1) + 1e-8)
 
                 # --------------------------------------------------------------
                 # 2. Clipped value objective
@@ -159,8 +225,15 @@ class PPOLearner(OnPolicyLearner):
                 # value_targets are the fixed TD(lambda) regression labels. With
                 # clipping disabled, use the ordinary critic semi-gradient loss.
                 if self.cfg.value_clip_range is None:
+                    loss_values, loss_targets = values, batch.value_targets
+                    if self.value_target_stats is not None:
+                        # Scale only the regression loss; GAE keeps raw values.
+                        self.value_target_stats.update(batch.value_targets)
+                        scale = (self.value_target_stats.var + 1e-8).sqrt().clamp_min(1.0)
+                        loss_values = (values / scale).clamp(-10.0, 10.0)
+                        loss_targets = (batch.value_targets / scale).clamp(-10.0, 10.0)
                     value_loss = 0.5 * (
-                        batch.value_targets - values
+                        loss_targets - loss_values
                     ).square().mean()
                 else:
                     # Restrict the candidate prediction relative to V_old(S):
@@ -194,15 +267,20 @@ class PPOLearner(OnPolicyLearner):
                 # ratio = pi_theta(A|S) / pi_old(A|S). The denominator remains
                 # fixed because old_log_probs were stored during collection.
                 log_ratios = log_probs - batch.old_log_probs
-                ratios = torch.exp(log_ratios)
+                objective_log_ratios = log_ratios
+                if self.cfg.log_ratio_clip is not None:
+                    objective_log_ratios = log_ratios.clamp(
+                        -self.cfg.log_ratio_clip, self.cfg.log_ratio_clip,
+                    )
+                ratios = torch.exp(objective_log_ratios)
 
                 # Maximize the smaller of the ordinary and ratio-clipped
                 # surrogate terms for each sampled transition.
-                unclipped_objective = ratios * batch.advantages
+                unclipped_objective = ratios * batch_advantages
                 clipped_objective = ratios.clip(
                     min=1.0 - self.cfg.clip_range,
                     max=1.0 + self.cfg.clip_range,
-                ) * batch.advantages
+                ) * batch_advantages
                 policy_loss = -(
                     torch.min(unclipped_objective, clipped_objective).mean()
                     + self.cfg.ent_coef * entropy
@@ -215,9 +293,12 @@ class PPOLearner(OnPolicyLearner):
                 # These diagnostics use the rollout actions and do not participate
                 # in either gradient computation.
                 with torch.no_grad():
-                    approximate_kl = ((ratios - 1.0) - log_ratios).mean()
+                    diagnostic_ratios = (
+                        log_ratios.exp() if self.cfg.log_ratio_clip is not None else ratios
+                    )
+                    approximate_kl = ((diagnostic_ratios - 1.0) - log_ratios).mean()
                     clip_fraction = (
-                        (ratios - 1.0).abs() > self.cfg.clip_range
+                        (diagnostic_ratios - 1.0).abs() > self.cfg.clip_range
                     ).float().mean()
 
                 # Stop before another optimizer step when the current policy has
@@ -261,16 +342,16 @@ class PPOLearner(OnPolicyLearner):
                 num_samples += num_batch_samples
                 gradient_steps += 1
 
-                for name, value in (
-                    ("losses/policy_loss", policy_loss),
-                    ("losses/value_loss", value_loss),
-                    ("diagnostics/entropy", entropy),
-                    ("diagnostics/approximate_kl", approximate_kl),
-                    ("diagnostics/clip_fraction", clip_fraction),
-                    ("grads/policy_norm", policy_grad_norm),
-                    ("grads/value_norm", value_grad_norm),
-                ):
-                    metric_sums[name] += value.detach().item() * num_batch_samples
+                minibatch_metrics = torch.stack((
+                    policy_loss.detach(),
+                    value_loss.detach(),
+                    entropy.detach(),
+                    approximate_kl.detach(),
+                    clip_fraction.detach(),
+                    policy_grad_norm.detach(),
+                    value_grad_norm.detach(),
+                ))
+                metric_sums.add_(minibatch_metrics, alpha=num_batch_samples)
 
             if stop_early:
                 break
@@ -279,11 +360,76 @@ class PPOLearner(OnPolicyLearner):
         # 7. Update metric reduction
         # ------------------------------------------------------------------
 
-        # Produce one sample-weighted mean for the complete PPO update phase.
-        metrics = {
-            name: total / num_samples
-            for name, total in metric_sums.items()
-        }
+        # Transfer metrics once, then report sample-weighted update means.
+        metrics = {}
+        if num_samples > 0:
+            metrics = {
+                name: total / num_samples
+                for name, total in zip(metric_names, metric_sums.tolist())
+            }
+
+        rollout_size = buffer.rollout_steps * buffer.num_envs
+        metrics.update({
+            "diagnostics/early_stop": float(stop_early),
+            "diagnostics/optimizer_steps": float(gradient_steps),
+            "diagnostics/effective_epochs": num_samples / rollout_size,
+            # Unlike the update average, this includes a rejected minibatch.
+            "diagnostics/last_minibatch_kl": approximate_kl.item(),
+        })
+
+        # Re-evaluate the final policy on every rollout sample, without another
+        # shuffle or optimizer step. This precedes observation-statistics updates.
+        assert buffer.observations is not None and buffer.actions is not None
+        observations = buffer.observations.flatten(0, 1)
+        actions = buffer.actions.flatten(0, 1)
+        old_log_probs = buffer.log_probs.flatten()
+        final_kl_sum = old_log_probs.new_zeros(())
+        gaussian_stats = None
+        num_action_components = 0
+        modes = [(module, module.training) for module in self.policy.modules()]
+        fork_devices = []
+        if self.cfg.device.type == "cuda":
+            fork_devices = [
+                self.cfg.device.index
+                if self.cfg.device.index is not None else torch.cuda.current_device()
+            ]
+        self.policy.eval()
+        try:
+            with torch.no_grad(), torch.random.fork_rng(devices=fork_devices):
+                for start in range(0, rollout_size, self.cfg.batch_size):
+                    stop = start + self.cfg.batch_size
+                    distribution = self.policy(observations[start:stop])
+                    log_ratio = (
+                        distribution.log_prob(actions[start:stop]) - old_log_probs[start:stop]
+                    )
+                    final_kl_sum = final_kl_sum + (log_ratio.exp() - 1 - log_ratio).sum()
+                    if isinstance(distribution, Independent) and isinstance(distribution.base_dist, Normal):
+                        std, mean_abs = distribution.stddev, distribution.mean.abs()
+                        current = torch.stack((std.sum(), std.min(), std.max(), mean_abs.sum(), mean_abs.max()))
+                        if gaussian_stats is None:
+                            gaussian_stats = current
+                        else:
+                            gaussian_stats[0] += current[0]
+                            gaussian_stats[1] = torch.minimum(gaussian_stats[1], current[1])
+                            gaussian_stats[2] = torch.maximum(gaussian_stats[2], current[2])
+                            gaussian_stats[3] += current[3]
+                            gaussian_stats[4] = torch.maximum(gaussian_stats[4], current[4])
+                        num_action_components += std.numel()
+        finally:
+            for module, training in modes:
+                module.training = training
+
+        metrics["diagnostics/final_approximate_kl"] = (final_kl_sum / rollout_size).item()
+        if gaussian_stats is not None:
+            gaussian_stats[0] /= num_action_components
+            gaussian_stats[3] /= num_action_components
+            metrics.update(zip((
+                "diagnostics/action_std_mean",
+                "diagnostics/action_std_min",
+                "diagnostics/action_std_max",
+                "diagnostics/action_mean_abs_mean",
+                "diagnostics/action_mean_abs_max",
+            ), gaussian_stats.tolist()))
 
         # Explained variance uses collection-time values and fixed TD(lambda)
         # targets over the complete rollout, matching the other on-policy learners.
@@ -316,6 +462,8 @@ def ppo(
     checkpoint_interval: int | None = None,
     run_config: dict[str, Any] | None = None,
     resume_from: str | Path | None = None,
+    obs_normalizer: RunningNormalizer | None = None,
+    reward_scaler: RewardScaler | None = None,
 ) -> MetricHistory:
     """Construct a PPO learner and run the shared on-policy training loop."""
 
@@ -331,4 +479,6 @@ def ppo(
         checkpoint_interval=checkpoint_interval,
         run_config=run_config,
         resume_from=resume_from,
+        obs_normalizer=obs_normalizer,
+        reward_scaler=reward_scaler,
     )

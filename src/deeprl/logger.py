@@ -7,13 +7,13 @@ import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import torch
 
-from deeprl.stats import TrainingStats
+from deeprl.stats import TrainingProgress, TrainingStats
 from deeprl.utils import explained_variance
 
 if TYPE_CHECKING:
@@ -75,8 +75,7 @@ class Logger:
         self.log_every = log_every
         self.writer = writer
         self.device = torch.device(device)
-        self.global_step = 0
-        self.gradient_step = 0
+        self._training_progress = TrainingProgress()
 
         self._history: defaultdict[str, deque[MetricPoint]] = defaultdict(
             lambda: deque(maxlen=history_size)
@@ -119,14 +118,26 @@ class Logger:
             from tqdm import tqdm
 
             self._progress = tqdm(total=total_timesteps, unit="step", dynamic_ncols=True)
+    
+    @property
+    def global_step(self) -> int:
+        """Environment transitions in the last trainer-supplied snapshot."""
+        return self._training_progress.global_step
 
-    def resume(self, *, global_step: int, gradient_step: int) -> None:
-        """Restore counters and start fresh episode statistics and session timing."""
-        if global_step < 0 or gradient_step < 0:
-            raise ValueError("global_step and gradient_step must be non-negative")
+    @property
+    def gradient_step(self) -> int:
+        """Gradient steps in the last trainer-supplied snapshot."""
+        return self._training_progress.gradient_step
 
-        self.global_step = global_step
-        self.gradient_step = gradient_step
+    def _set_training_progress(self, progress: TrainingProgress) -> None:
+        self._training_progress = progress
+        if self._progress is not None:
+            position = min(progress.global_step, self._progress.total)
+            self._progress.update(max(position - self._progress.n, 0))
+
+    def resume(self, *, progress: TrainingProgress) -> None:
+        """Adopt restored progress and reset episode statistics and session timing."""
+        self._training_progress = progress
         self._history.clear()
         self._episode_returns.zero_()
         self._episode_lengths.zero_()
@@ -138,18 +149,18 @@ class Logger:
         self._ev_targets.clear()
 
         self._start_time = time.perf_counter()
-        self._start_step = global_step
+        self._start_step = progress.global_step
         self._last_dump_time = self._start_time
-        self._last_dump_step = global_step
+        self._last_dump_step = progress.global_step
         self._next_log_step = (
-            (global_step // self.log_every + 1) * self.log_every
+            (progress.global_step // self.log_every + 1) * self.log_every
             if self.log_every > 0
             else None
         )
 
         if self._progress is not None:
             self._progress.reset()
-            position = min(global_step, self._progress.total)
+            position = min(progress.global_step, self._progress.total)
             self._progress.n = position
             self._progress.initial = position
             self._progress.last_print_n = position
@@ -162,6 +173,7 @@ class Logger:
         rewards: torch.Tensor,
         dones: torch.Tensor,
         *,
+        progress: TrainingProgress,
         values: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
     ) -> None:
@@ -184,13 +196,9 @@ class Logger:
         )
         dones = dones.detach().to(device=self.device, dtype=torch.bool)
 
-        self.global_step += self.num_envs
+        self._set_training_progress(progress)
         self._episode_returns += rewards
         self._episode_lengths += 1
-
-        if self._progress is not None:
-            remaining = max(self._progress.total - self._progress.n, 0)
-            self._progress.update(min(self.num_envs, remaining))
 
         if values is not None and targets is not None:
             self._ev_values.extend(values.detach().flatten().tolist())
@@ -218,8 +226,10 @@ class Logger:
         self,
         rewards: torch.Tensor,
         dones: torch.Tensor,
+        *,
+        progress: TrainingProgress,
     ) -> None:
-        """Accumulate a time-major ``(T, N)`` rollout without dumping."""
+        """Accumulate a ``(T, N)`` rollout using its end-of-collection progress."""
         if rewards.ndim != 2 or rewards.shape[1] != self.num_envs:
             raise ValueError(
                 f"rewards must have shape (T, {self.num_envs}), got {tuple(rewards.shape)}"
@@ -229,23 +239,38 @@ class Logger:
                 f"dones must have shape {tuple(rewards.shape)}, got {tuple(dones.shape)}"
             )
 
-        for step_rewards, step_dones in zip(rewards, dones, strict=True):
-            self.log_step(step_rewards, step_dones)
+        start_step = progress.global_step - rewards.shape[0] * self.num_envs
+        if start_step < 0:
+            raise ValueError("rollout cannot start before global_step zero")
+
+        for index, (step_rewards, step_dones) in enumerate(
+            zip(rewards, dones, strict=True)
+        ):
+            step_progress = replace(
+                progress,
+                global_step=start_step + (index + 1) * self.num_envs,
+            )
+            self.log_step(step_rewards, step_dones, progress=step_progress)
+        self._set_training_progress(progress)
 
     # ------------------------------------------------------------------ update
 
-    def log_update(self, stats: TrainingStats) -> None:
+    def log_update(
+        self, stats: TrainingStats, *, progress: TrainingProgress
+    ) -> None:
         """Accumulate one complete algorithm-update summary."""
-        weight = stats.gradient_steps
-        if weight <= 0:
-            raise ValueError("gradient_steps must be positive")
-
-        self.gradient_step += weight
+        if stats.gradient_steps < 0:
+            raise ValueError("gradient_steps must be non-negative")
+        
+        self._set_training_progress(progress)
+        
+        # Retain diagnostics even when no optimizer step was performed.
+        weight = max(stats.gradient_steps, 1)
         for name, value in stats.metrics.items():
             scalar = _scalar(value)
             self._metric_sums[name] += scalar * weight
             self._metric_weights[name] += weight
-
+       
     def maybe_dump(self) -> None:
         """Write one report when the environment-step threshold is crossed."""
         if self._next_log_step is None or self.global_step < self._next_log_step:
@@ -304,6 +329,7 @@ class Logger:
         episode_returns: torch.Tensor,
         episode_lengths: torch.Tensor,
         *,
+        progress: TrainingProgress,
         deterministic: bool,
     ) -> None:
         """Record raw episodes and their within-run evaluation summary."""
@@ -314,6 +340,7 @@ class Logger:
         if returns.numel() == 0:
             raise ValueError("evaluation must contain at least one episode")
 
+        self._set_training_progress(progress)
         mode = "deterministic" if deterministic else "stochastic"
         for episode_return, episode_length in zip(
             returns.tolist(), lengths.tolist(), strict=True

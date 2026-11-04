@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter
 
     from deeprl.evaluate import Evaluator
+    from deeprl.normalization import RewardScaler, RunningNormalizer
 
 
 def _flat_grad(
@@ -128,6 +129,9 @@ class NPGConfig(OnPolicyConfig):
 class NPGLearner(OnPolicyLearner):
     """Natural policy-gradient and critic updates."""
 
+    mutable_on_resume = OnPolicyLearner.mutable_on_resume | {"lr_critic"}
+    learning_rate_fields = {"lr_critic": "optim_critic"}
+
     def __init__(
         self,
         policy      :   nn.Module,
@@ -140,26 +144,34 @@ class NPGLearner(OnPolicyLearner):
 
         # Preserve one fixed parameter order for flattened gradients and steps.
         self.policy_parameters: tuple[nn.Parameter, ...] = tuple(
-            self.policy.parameters()
+            parameter
+            for parameter in self.policy.parameters()
+            if parameter.requires_grad
         )
+        
+        if not self.policy_parameters:
+            raise ValueError(
+                "policy must have at least one trainable parameter"
+            )
+
+        self.configure_optimizers()
+
+    def configure_optimizers(self) -> None:
+        """Construct the critic optimizer exactly once."""
+        if hasattr(self, "optim_critic"):
+            raise RuntimeError("optimizers are already configured")
 
         # NPG computes the policy step directly; only the critic uses an optimizer.
-        self.optim_critic = cfg.critic_optimizer_class(
+        self.optim_critic = self.cfg.critic_optimizer_class(
             self.value_fn.parameters(),
-            lr=cfg.lr_critic,
-            **cfg.critic_optimizer_kwargs,
+            lr=self.cfg.lr_critic,
+            **self.cfg.critic_optimizer_kwargs,
         )
 
-    def state_dict(self) -> dict[str, Any]:
-        """Return network and critic optimizer states."""
-        state = super().state_dict()
-        state["optim_critic"] = self.optim_critic.state_dict()
-        return state
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        """Restore network and critic optimizer states."""
-        super().load_state_dict(state)
-        self.optim_critic.load_state_dict(state["optim_critic"])
+    @property
+    def optimizers_by_role(self) -> dict[str, torch.optim.Optimizer]:
+        """Return the critic optimizer under its checkpoint role name."""
+        return {"optim_critic": self.optim_critic}
 
     def _surrogate_objective(
         self,
@@ -499,6 +511,8 @@ def npg(
     checkpoint_interval: int | None = None,
     run_config: dict[str, Any] | None = None,
     resume_from: str | Path | None = None,
+    obs_normalizer: RunningNormalizer | None = None,
+    reward_scaler: RewardScaler | None = None,
 ) -> MetricHistory:
     """Construct an NPG learner and run the shared on-policy training loop."""
     learner = NPGLearner(policy, value_fn, cfg)
@@ -513,4 +527,6 @@ def npg(
         checkpoint_interval=checkpoint_interval,
         run_config=run_config,
         resume_from=resume_from,
+        obs_normalizer=obs_normalizer,
+        reward_scaler=reward_scaler,
     )

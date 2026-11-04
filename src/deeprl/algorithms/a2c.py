@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter
 
     from deeprl.evaluate import Evaluator
+    from deeprl.normalization import RewardScaler, RunningNormalizer
 
 
 @dataclass(frozen=True)
@@ -44,10 +45,17 @@ class A2CConfig(OnPolicyConfig):
     critic_optimizer_class  :   type[torch.optim.Optimizer] = torch.optim.Adam
     critic_optimizer_kwargs :   dict[str, Any] = field(default_factory=dict)
 
-
 class A2CLearner(OnPolicyLearner):
     """A2C optimizers and algorithm-specific full-rollout update."""
 
+    mutable_on_resume = OnPolicyLearner.mutable_on_resume | {
+        "lr_actor", "lr_critic", "ent_coef",
+    }
+    learning_rate_fields = {
+        "lr_actor": "optim_actor",
+        "lr_critic": "optim_critic",
+    }
+    
     def __init__(
         self,
         policy      :   nn.Module,
@@ -56,31 +64,32 @@ class A2CLearner(OnPolicyLearner):
     ) -> None:
         super().__init__(policy, value_fn, cfg)
         self.cfg: A2CConfig = cfg
+        self.configure_optimizers()
+    
+    def configure_optimizers(self) -> None:
+        """Construct the actor and critic optimizers exactly once."""
+        if hasattr(self, "optim_actor") or hasattr(self, "optim_critic"):
+            raise RuntimeError("optimizers are already configured")
 
         # Construct optimizers after the networks are moved to their device.
-        self.optim_actor = cfg.actor_optimizer_class(
+        self.optim_actor = self.cfg.actor_optimizer_class(
             self.policy.parameters(),
-            lr=cfg.lr_actor,
-            **cfg.actor_optimizer_kwargs,
+            lr=self.cfg.lr_actor,
+            **self.cfg.actor_optimizer_kwargs,
         )
-        self.optim_critic = cfg.critic_optimizer_class(
+        self.optim_critic = self.cfg.critic_optimizer_class(
             self.value_fn.parameters(),
-            lr=cfg.lr_critic,
-            **cfg.critic_optimizer_kwargs,
+            lr=self.cfg.lr_critic,
+            **self.cfg.critic_optimizer_kwargs,
         )
-
-    def state_dict(self) -> dict[str, Any]:
-        """Return network and optimizer states."""
-        state = super().state_dict()
-        state["optim_actor"] = self.optim_actor.state_dict()
-        state["optim_critic"] = self.optim_critic.state_dict()
-        return state
-
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        """Restore network and optimizer states."""
-        super().load_state_dict(state)
-        self.optim_actor.load_state_dict(state["optim_actor"])
-        self.optim_critic.load_state_dict(state["optim_critic"])
+    
+    @property
+    def optimizers_by_role(self) -> dict[str, torch.optim.Optimizer]:
+        """Return the optimizers under their checkpoint role names."""
+        return {
+            "optim_actor": self.optim_actor,
+            "optim_critic": self.optim_critic,
+        }
 
     def update(
         self,
@@ -238,6 +247,8 @@ def a2c(
     checkpoint_interval: int | None = None,
     run_config: dict[str, Any] | None = None,
     resume_from: str | Path | None = None,
+    obs_normalizer: RunningNormalizer | None = None,
+    reward_scaler: RewardScaler | None = None,
 ) -> MetricHistory:
     """Train policy and value networks using synchronous A2C.
 
@@ -257,4 +268,6 @@ def a2c(
         checkpoint_interval=checkpoint_interval,
         run_config=run_config,
         resume_from=resume_from,
+        obs_normalizer=obs_normalizer,
+        reward_scaler=reward_scaler,
     )
