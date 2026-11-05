@@ -6,13 +6,14 @@ from dataclasses import dataclass, field
 from math import isfinite
 from numbers import Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 from gymnasium.vector import VectorEnv
 from torch.distributions import Distribution
 
+from deeprl import learner_state
 from deeprl.algorithms.on_policy import (
     OnPolicyConfig,
     OnPolicyLearner,
@@ -76,10 +77,6 @@ class A2CLearner(OnPolicyLearner):
     mutable_on_resume = OnPolicyLearner.mutable_on_resume | {
         "lr_actor", "lr_critic", "ent_coef",
     }
-    learning_rate_fields: ClassVar[dict[str, str]] = {
-        "lr_actor": "optim_actor",
-        "lr_critic": "optim_critic",
-    }
     
     def __init__(
         self,
@@ -108,13 +105,33 @@ class A2CLearner(OnPolicyLearner):
             **self.cfg.critic_optimizer_kwargs,
         )
     
-    @property
-    def optimizers_by_role(self) -> dict[str, torch.optim.Optimizer]:
-        """Return the optimizers under their checkpoint role names."""
+    def state_dict(self) -> dict[str, Any]:
+        """Return network and optimizer states under their checkpoint keys."""
         return {
-            "optim_actor": self.optim_actor,
-            "optim_critic": self.optim_critic,
+            "policy": self.policy.state_dict(),
+            "value_fn": self.value_fn.state_dict(),
+            "optim_actor": self.optim_actor.state_dict(),
+            "optim_critic": self.optim_critic.state_dict(),
         }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Validate checkpoint keys before restoring existing components."""
+        learner_state.validate_state_keys(
+            state, {"policy", "value_fn", "optim_actor", "optim_critic"}
+        )
+        self.policy.load_state_dict(state["policy"])
+        self.value_fn.load_state_dict(state["value_fn"])
+        self.optim_actor.load_state_dict(state["optim_actor"])
+        self.optim_critic.load_state_dict(state["optim_critic"])
+
+    def apply_resume_overrides(self, overrides: dict[str, Any]) -> None:
+        """Apply changed learning rates after restoring optimizer state."""
+        if "lr_actor" in overrides:
+            for group in self.optim_actor.param_groups:
+                group["lr"] = overrides["lr_actor"]
+        if "lr_critic" in overrides:
+            for group in self.optim_critic.param_groups:
+                group["lr"] = overrides["lr_critic"]
 
     def update(
         self,

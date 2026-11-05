@@ -6,13 +6,14 @@ from dataclasses import dataclass, field
 from math import isfinite
 from numbers import Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 from gymnasium.vector import VectorEnv
 from torch.distributions import Distribution, Independent, Normal
 
+from deeprl import learner_state
 from deeprl.algorithms.on_policy import (
     OnPolicyConfig,
     OnPolicyLearner,
@@ -110,10 +111,6 @@ class PPOLearner(OnPolicyLearner):
     mutable_on_resume = OnPolicyLearner.mutable_on_resume | {
         "lr_actor", "lr_critic", "ent_coef", "target_kl", "batch_size",
     }
-    learning_rate_fields: ClassVar[dict[str, str]] = {
-        "lr_actor": "optim_actor",
-        "lr_critic": "optim_critic",
-    }
     
     def __init__(
         self,
@@ -146,24 +143,39 @@ class PPOLearner(OnPolicyLearner):
             **self.cfg.critic_optimizer_kwargs,
         )
     
-    @property
-    def modules_by_role(self) -> dict[str, nn.Module]:
-        """Include optional value-target statistics in learner state."""
-        modules = super().modules_by_role
+    def state_dict(self) -> dict[str, Any]:
+        """Return network, optimizer, and optional value-target states."""
+        state = {
+            "policy": self.policy.state_dict(),
+            "value_fn": self.value_fn.state_dict(),
+            "optim_actor": self.optim_actor.state_dict(),
+            "optim_critic": self.optim_critic.state_dict(),
+        }
         if self.value_target_stats is not None:
-            modules["value_target_stats"] = self.value_target_stats
-        return modules
-    
-    @property
-    def optimizers_by_role(self) -> dict[str, torch.optim.Optimizer]:
-        """Return actor and critic optimizers under their existing state keys."""
-        return {"optim_actor": self.optim_actor, "optim_critic": self.optim_critic}
+            state["value_target_stats"] = self.value_target_stats.state_dict()
+        return state
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        """Restore network and optimizer states."""
-        if (self.value_target_stats is not None) != ("value_target_stats" in state):
-            raise ValueError("checkpoint value-target normalization does not match the learner")
-        super().load_state_dict(state)
+        """Validate checkpoint keys before restoring existing components."""
+        expected_keys = {"policy", "value_fn", "optim_actor", "optim_critic"}
+        if self.value_target_stats is not None:
+            expected_keys.add("value_target_stats")
+        learner_state.validate_state_keys(state, expected_keys)
+        self.policy.load_state_dict(state["policy"])
+        self.value_fn.load_state_dict(state["value_fn"])
+        self.optim_actor.load_state_dict(state["optim_actor"])
+        self.optim_critic.load_state_dict(state["optim_critic"])
+        if self.value_target_stats is not None:
+            self.value_target_stats.load_state_dict(state["value_target_stats"])
+
+    def apply_resume_overrides(self, overrides: dict[str, Any]) -> None:
+        """Apply changed learning rates after restoring optimizer state."""
+        if "lr_actor" in overrides:
+            for group in self.optim_actor.param_groups:
+                group["lr"] = overrides["lr_actor"]
+        if "lr_critic" in overrides:
+            for group in self.optim_critic.param_groups:
+                group["lr"] = overrides["lr_critic"]
 
     def update(
         self,

@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from math import isfinite
 from numbers import Real
-from typing import Any, ClassVar
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -65,10 +65,9 @@ class OnPolicyConfig:
 
 
 class OnPolicyLearner(ABC):
-    """On-policy update, named state, and resume-validation contract."""
+    """On-policy update, explicit learner state, and resume contract."""
 
     mutable_on_resume = frozenset({"total_timesteps", "device", "log_every"})
-    learning_rate_fields: ClassVar[dict[str, str]] = {}
 
     def __init__(
         self,
@@ -85,47 +84,32 @@ class OnPolicyLearner(ABC):
         self.policy = policy.to(self.cfg.device)
         self.value_fn = value_fn.to(self.cfg.device)
 
-    @property
-    def modules_by_role(self) -> dict[str, nn.Module]:
-        """Return checkpointed modules under their stable state keys."""
-        return {
-            "policy": self.policy,
-            "value_fn": self.value_fn,
-        }
-
-    @property
-    def optimizers_by_role(self) -> dict[str, torch.optim.Optimizer]:
-        """Return optimizer state; manual-update learners may return none."""
-        return {}
-
+    @abstractmethod
     def state_dict(self) -> dict[str, Any]:
-        """Return named module and optimizer states using the existing flat layout."""
-        return learner_state.learner_state_dict(
-            self.modules_by_role, self.optimizers_by_role
-        )
+        """Return all network, optimizer, and auxiliary learning state."""
+        raise NotImplementedError
 
+    @abstractmethod
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        """Check component names before restoring modules and optimizers."""
-        learner_state.load_learner_state_dict(
-            state, self.modules_by_role, self.optimizers_by_role
-        )
+        """Validate component names and restore existing learning objects."""
+        raise NotImplementedError
 
     def validate_resume_config(
         self,
         saved_config: dict[str, Any],
         current_config: dict[str, Any],
-    ) -> dict[str, float]:
-        """Validate configuration and return changed learning rates by optimizer role."""
+    ) -> dict[str, Any]:
+        """Validate configuration and return changed allowed fields by name."""
         return learner_state.validate_resume_config(
             saved_config,
             current_config,
             mutable_on_resume=self.mutable_on_resume,
-            learning_rate_fields=self.learning_rate_fields,
         )
 
-    def apply_resume_overrides(self, learning_rates: dict[str, float]) -> None:
-        """Apply configured learning-rate changes after restoring optimizer state."""
-        learner_state.apply_resume_overrides(learning_rates, self.optimizers_by_role)
+    @abstractmethod
+    def apply_resume_overrides(self, overrides: dict[str, Any]) -> None:
+        """Apply explicit config changes after restoring learning state."""
+        raise NotImplementedError
 
     @abstractmethod
     def update(

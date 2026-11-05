@@ -104,7 +104,7 @@ benchmark work, separate from having a runnable example.
 - **Data and targets:** [buffers.py](src/deeprl/buffers.py), [rollouts.py](src/deeprl/rollouts.py), and [advantages.py](src/deeprl/advantages.py) separate storage, interaction, and advantage estimation.
 - **Networks and preprocessing:** [policies.py](src/deeprl/policies.py) and [value.py](src/deeprl/value.py) wrap caller-supplied networks; [normalization.py](src/deeprl/normalization.py) provides explicit running statistics. Architectures stay with the task examples.
 - **Evaluation and logging:** [evaluate.py](src/deeprl/evaluate.py) and [logger.py](src/deeprl/logger.py) handle policy assessment, episode statistics, JSONL metrics, and optional TensorBoard output.
-- **State and continuation:** [learner_state.py](src/deeprl/learner_state.py), [checkpoint.py](src/deeprl/checkpoint.py), and [lifecycle.py](src/deeprl/lifecycle.py) handle native state dictionaries, resume checks, configuration, Torch RNG state, and provenance.
+- **State and continuation:** Concrete learners explicitly save/load their native component state. [learner_state.py](src/deeprl/learner_state.py) validates state keys and resume configuration; [checkpoint.py](src/deeprl/checkpoint.py) and [lifecycle.py](src/deeprl/lifecycle.py) handle checkpoint I/O, configuration, Torch RNG state, and provenance.
 
 Rollout buffers preserve the time/environment layout `(T, N)`. Replay buffers
 use flat FIFO transition storage. Both support fixed-shape tensors and

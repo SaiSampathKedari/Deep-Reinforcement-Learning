@@ -8,13 +8,14 @@ from functools import partial
 from math import isfinite
 from numbers import Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 from gymnasium.vector import VectorEnv
 from torch.distributions import Distribution, kl_divergence
 
+from deeprl import learner_state
 from deeprl.algorithms.on_policy import (
     OnPolicyConfig,
     OnPolicyLearner,
@@ -170,7 +171,6 @@ class NPGLearner(OnPolicyLearner):
     algorithm_id = "npg"
 
     mutable_on_resume = OnPolicyLearner.mutable_on_resume | {"lr_critic"}
-    learning_rate_fields: ClassVar[dict[str, str]] = {"lr_critic": "optim_critic"}
 
     def __init__(
         self,
@@ -208,10 +208,28 @@ class NPGLearner(OnPolicyLearner):
             **self.cfg.critic_optimizer_kwargs,
         )
 
-    @property
-    def optimizers_by_role(self) -> dict[str, torch.optim.Optimizer]:
-        """Return the critic optimizer under its checkpoint role name."""
-        return {"optim_critic": self.optim_critic}
+    def state_dict(self) -> dict[str, Any]:
+        """Return network and critic optimizer states."""
+        return {
+            "policy": self.policy.state_dict(),
+            "value_fn": self.value_fn.state_dict(),
+            "optim_critic": self.optim_critic.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Validate checkpoint keys before restoring existing components."""
+        learner_state.validate_state_keys(
+            state, {"policy", "value_fn", "optim_critic"}
+        )
+        self.policy.load_state_dict(state["policy"])
+        self.value_fn.load_state_dict(state["value_fn"])
+        self.optim_critic.load_state_dict(state["optim_critic"])
+
+    def apply_resume_overrides(self, overrides: dict[str, Any]) -> None:
+        """Apply a changed critic rate after restoring optimizer state."""
+        if "lr_critic" in overrides:
+            for group in self.optim_critic.param_groups:
+                group["lr"] = overrides["lr_critic"]
 
     def _surrogate_objective(
         self,

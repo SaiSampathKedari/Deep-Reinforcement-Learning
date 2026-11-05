@@ -129,7 +129,7 @@ def _validate_resume(
     learner_config: dict[str, Any],
     num_envs: int,
     preprocessing_config: dict[str, Any],
-) -> tuple[TrainingProgress, dict[str, float]]:
+) -> tuple[TrainingProgress, dict[str, Any]]:
     """Check workflow and learner compatibility without loading any state."""
     validate_training_checkpoint(
         checkpoint, required_keys=("num_envs", "preprocessing_config"),
@@ -138,7 +138,7 @@ def _validate_resume(
     if checkpoint["num_envs"] != num_envs:
         raise ValueError("checkpoint num_envs does not match the environment")
 
-    learning_rates = learner.validate_resume_config(
+    resume_overrides = learner.validate_resume_config(
         config_to_jsonable(checkpoint["learner_config"]), learner_config,
     )
     progress = TrainingProgress(**checkpoint["progress"])
@@ -154,20 +154,20 @@ def _validate_resume(
         raise ValueError("checkpoint reward scaling does not match this run")
     if config_to_jsonable(checkpoint["preprocessing_config"]) != preprocessing_config:
         raise ValueError("checkpoint preprocessing configuration does not match this run")
-    return progress, learning_rates
+    return progress, resume_overrides
 
 
 def _restore_training_state(
     checkpoint: dict[str, Any],
     *,
     learner: OnPolicyLearner,
-    learning_rates: dict[str, float],
+    resume_overrides: dict[str, Any],
     obs_normalizer: RunningNormalizer | None,
     reward_scaler: RewardScaler | None,
 ) -> None:
     """Restore learning components; the trainer restores RNG after env setup."""
     learner.load_state_dict(checkpoint["learner"])
-    learner.apply_resume_overrides(learning_rates)
+    learner.apply_resume_overrides(resume_overrides)
     if reward_scaler is not None:
         reward_scaler.load_state_dict(checkpoint["reward_scaler"])
     if learner.cfg.normalize_observations_during_collection:
@@ -266,10 +266,10 @@ def train_on_policy(
     preprocessing_config = _preprocessing_config(obs_normalizer, reward_scaler)
     progress = TrainingProgress()
     checkpoint = None
-    learning_rate_overrides: dict[str, float] = {}
+    resume_overrides: dict[str, Any] = {}
     if resume_from is not None:
         checkpoint = load_checkpoint(resume_from, map_location="cpu")
-        progress, learning_rate_overrides = _validate_resume(
+        progress, resume_overrides = _validate_resume(
             checkpoint,
             learner=learner,
             learner_config=learner_config,
@@ -292,7 +292,7 @@ def train_on_policy(
         _restore_training_state(
             checkpoint,
             learner=learner,
-            learning_rates=learning_rate_overrides,
+            resume_overrides=resume_overrides,
             obs_normalizer=obs_normalizer,
             reward_scaler=reward_scaler,
         )
