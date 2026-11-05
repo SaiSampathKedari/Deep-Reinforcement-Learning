@@ -13,7 +13,7 @@ import torch.nn as nn
 from gymnasium.vector import VectorEnv
 from torch.distributions import Distribution, Independent, Normal
 
-from deeprl.algorithms.on_policy_base import (
+from deeprl.algorithms.on_policy import (
     OnPolicyConfig,
     OnPolicyLearner,
 )
@@ -106,15 +106,9 @@ class PPOLearner(OnPolicyLearner):
     """PPO-Clip optimizers and multi-epoch minibatch update."""
 
     algorithm_id = "ppo"
-    legacy_algorithm_ids = ("deeprl.algorithms.ppo.PPOLearner",)
 
     mutable_on_resume = OnPolicyLearner.mutable_on_resume | {
         "lr_actor", "lr_critic", "ent_coef", "target_kl", "batch_size",
-    }
-    resume_defaults: ClassVar[dict[str, Any]] = {
-        **OnPolicyLearner.resume_defaults,
-        "normalize_advantage_per_minibatch": False,
-        "normalize_value_targets": False,
     }
     learning_rate_fields: ClassVar[dict[str, str]] = {
         "lr_actor": "optim_actor",

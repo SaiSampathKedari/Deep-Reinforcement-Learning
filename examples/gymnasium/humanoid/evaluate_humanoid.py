@@ -64,7 +64,7 @@ def main() -> None:
     )
     try:
         # Reconstruct action coordinates from the checkpoint, not current defaults.
-        action_range = settings.get("action_range")
+        action_range = settings["action_range"]
         if action_range is not None:
             action_dtype = env.action_space.dtype.type
             env = gym.wrappers.RescaleAction(
@@ -87,22 +87,22 @@ def main() -> None:
         mean_network: nn.Module = PolicyNetwork(
             obs_dim, action_dim, tuple(settings["policy_hidden_sizes"])
         )
-        # Older checkpoints used raw observations and have no normalizer settings.
-        obs_normalization = settings.get("obs_normalization")
+        obs_normalization = settings["obs_normalization"]
+        obs_normalization_in_policy = settings["obs_normalization_in_policy"]
         normalizer = None
         if obs_normalization is not None:
             normalizer = RunningNormalizer((obs_dim,), **obs_normalization)
-            if settings.get("obs_normalization_in_policy", True):
+            if obs_normalization_in_policy:
                 mean_network = nn.Sequential(normalizer, mean_network)
         policy = DiagonalGaussianPolicy(
             mean_network,
             action_dim=action_dim,
             log_std_init=settings["log_std_init"],
-            log_std_bounds=settings.get("log_std_bounds"),
+            log_std_bounds=settings["log_std_bounds"],
         ).to(args.device)
         # Restore network weights, learned log std and frozen observation statistics.
         policy.load_state_dict(checkpoint["learner"]["policy"])
-        if normalizer is not None and not settings.get("obs_normalization_in_policy", True):
+        if normalizer is not None and not obs_normalization_in_policy:
             normalizer.load_state_dict(checkpoint["obs_normalizer"])
             policy = nn.Sequential(normalizer, policy).to(args.device)
 

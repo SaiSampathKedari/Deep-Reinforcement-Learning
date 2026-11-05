@@ -79,8 +79,7 @@ def main() -> None:
         mean_network: nn.Module = PolicyNetwork(
             obs_dim, action_dim, tuple(settings["policy_hidden_sizes"])
         )
-        # Older checkpoints used raw observations and have no normalizer settings.
-        obs_normalization = settings.get("obs_normalization")
+        obs_normalization = settings["obs_normalization"]
         if obs_normalization is not None:
             mean_network = nn.Sequential(
                 RunningNormalizer((obs_dim,), **obs_normalization), mean_network

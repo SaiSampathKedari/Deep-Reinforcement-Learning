@@ -49,8 +49,8 @@ normalized, without subtracting a mean.
   newly reset observations update moments again and are normalized again.
   Continuing states keep their stored normalized representation, so bootstrap
   and next-current value inputs remain consistent. This corrects the earlier
-  full-batch re-normalization after partial resets; older checkpoints can load,
-  but continuation now uses the corrected collection behavior.
+  full-batch re-normalization after partial resets. Continuation requires the
+  current checkpoint contract and uses the corrected collection behavior.
 - Evaluation uses separate fixed seeds and frozen observation statistics. The
   12.288M budget extends the reference's 10M budget; one seed is not its four-seed study.
 

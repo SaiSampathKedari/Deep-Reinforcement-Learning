@@ -15,7 +15,7 @@ import torch.nn as nn
 from gymnasium.vector import VectorEnv
 from torch.distributions import Distribution, kl_divergence
 
-from deeprl.algorithms.on_policy_base import (
+from deeprl.algorithms.on_policy import (
     OnPolicyConfig,
     OnPolicyLearner,
 )
@@ -168,7 +168,6 @@ class NPGLearner(OnPolicyLearner):
     """Natural policy-gradient and critic updates."""
 
     algorithm_id = "npg"
-    legacy_algorithm_ids = ("deeprl.algorithms.npg.NPGLearner",)
 
     mutable_on_resume = OnPolicyLearner.mutable_on_resume | {"lr_critic"}
     learning_rate_fields: ClassVar[dict[str, str]] = {"lr_critic": "optim_critic"}

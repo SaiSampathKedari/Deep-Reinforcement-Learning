@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -11,7 +10,7 @@ import torch.nn as nn
 from gymnasium.vector import AutoresetMode, VectorEnv
 from gymnasium.spaces import Dict, Tuple
 
-from deeprl.algorithms.on_policy_base import OnPolicyLearner
+from deeprl.algorithms.on_policy import OnPolicyLearner
 from deeprl.advantages import generalized_advantage_estimate
 from deeprl.buffers import RolloutBuffer
 from deeprl.checkpoint import (
@@ -132,17 +131,16 @@ def _validate_resume(
     preprocessing_config: dict[str, Any],
 ) -> tuple[TrainingProgress, dict[str, float]]:
     """Check workflow and learner compatibility without loading any state."""
-    validate_training_checkpoint(checkpoint, required_keys=("num_envs",))
+    validate_training_checkpoint(
+        checkpoint, required_keys=("num_envs", "preprocessing_config"),
+    )
     validate_checkpoint_algorithm(checkpoint, type(learner))
-    if checkpoint.get("num_envs", num_envs) != num_envs:
+    if checkpoint["num_envs"] != num_envs:
         raise ValueError("checkpoint num_envs does not match the environment")
 
-    learning_rates = {}
-    saved_config = checkpoint.get("learner_config")
-    if saved_config is not None:
-        learning_rates = learner.validate_resume_config(
-            config_to_jsonable(saved_config), learner_config
-        )
+    learning_rates = learner.validate_resume_config(
+        config_to_jsonable(checkpoint["learner_config"]), learner_config,
+    )
     progress = TrainingProgress(**checkpoint["progress"])
     rollout_size = learner.cfg.rollout_steps * num_envs
     if progress.global_step != progress.update * rollout_size:
@@ -154,16 +152,8 @@ def _validate_resume(
         raise ValueError("checkpoint observation normalization does not match this run")
     if (preprocessing_config["reward"] is not None) != ("reward_scaler" in checkpoint):
         raise ValueError("checkpoint reward scaling does not match this run")
-    if "preprocessing_config" in checkpoint:
-        if config_to_jsonable(checkpoint["preprocessing_config"]) != preprocessing_config:
-            raise ValueError("checkpoint preprocessing configuration does not match this run")
-    elif any(settings is not None for settings in preprocessing_config.values()):
-        warnings.warn(
-            "checkpoint lacks preprocessing_config; normalization settings cannot be "
-            "verified. Reconstruct them from the original run configuration.",
-            UserWarning,
-            stacklevel=2,
-        )
+    if config_to_jsonable(checkpoint["preprocessing_config"]) != preprocessing_config:
+        raise ValueError("checkpoint preprocessing configuration does not match this run")
     return progress, learning_rates
 
 
@@ -211,7 +201,9 @@ def _checkpoint_state(
         checkpoint["reward_scaler"] = reward_scaler.state_dict()
     if learner.cfg.normalize_observations_during_collection:
         checkpoint["obs_normalizer"] = obs_normalizer.state_dict()
-    validate_training_checkpoint(checkpoint, required_keys=("num_envs",))
+    validate_training_checkpoint(
+        checkpoint, required_keys=("num_envs", "preprocessing_config"),
+    )
     return checkpoint
 
 
@@ -237,15 +229,14 @@ def train_on_policy(
     Checkpoint intervals count completed rollout updates. Resume restores the
     learner and counters, then starts fresh episodes toward total_timesteps.
     Use the same environment and networks; simulator state is not restored.
-    Versioned checkpoints declare the continue contract, not exact trajectory
-    continuation. Legacy checkpoints remain supported with reduced checks.
+    Checkpoints declare the continue contract, not exact trajectory continuation.
     Changed actor/critic learning rates override the saved optimizer rates
     without resetting optimizer state. Each learner declares which additional
     settings may change; PPO allows minibatch size, entropy and target KL.
     New checkpoints record the current configuration.
     run_config is optional JSON-compatible experiment metadata.
-    Trainer-managed preprocessing settings are checked before restoration;
-    older checkpoints without those settings load with a warning when enabled.
+    Required run state and trainer-managed preprocessing settings are checked
+    before restoration. Incomplete checkpoints are rejected.
 
     By default, an observation normalizer belongs to the policy and updates
     after each learner update. Collection-time normalization instead requires
@@ -286,7 +277,7 @@ def train_on_policy(
             preprocessing_config=preprocessing_config,
         )
         if run_config is None:
-            run_config = checkpoint.get("config")
+            run_config = checkpoint["config"]
     if run_config is not None:
         run_config = config_to_jsonable(run_config)
     provenance = get_provenance() if checkpoint_dir is not None else None
@@ -337,9 +328,8 @@ def train_on_policy(
         device=cfg.device,
     )
 
-    # Older checkpoints may contain learner/progress only. Restore RNG when
-    # available, after environment reset and storage initialization are done.
-    if checkpoint is not None and checkpoint.get("rng_state") is not None:
+    # Restore RNG after environment reset and storage initialization.
+    if checkpoint is not None:
         set_rng_state(checkpoint["rng_state"], device=cfg.device)
     checkpoint = None
 

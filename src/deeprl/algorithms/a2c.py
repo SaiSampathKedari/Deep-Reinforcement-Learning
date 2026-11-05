@@ -13,7 +13,7 @@ import torch.nn as nn
 from gymnasium.vector import VectorEnv
 from torch.distributions import Distribution
 
-from deeprl.algorithms.on_policy_base import (
+from deeprl.algorithms.on_policy import (
     OnPolicyConfig,
     OnPolicyLearner,
 )
@@ -72,7 +72,6 @@ class A2CLearner(OnPolicyLearner):
     """A2C optimizers and algorithm-specific full-rollout update."""
 
     algorithm_id = "a2c"
-    legacy_algorithm_ids = ("deeprl.algorithms.a2c.A2CLearner",)
 
     mutable_on_resume = OnPolicyLearner.mutable_on_resume | {
         "lr_actor", "lr_critic", "ent_coef",

@@ -120,16 +120,17 @@ from deeprl.training.train_on_policy import train_on_policy
 
 The [CartPole training script](examples/gymnasium/cartpole/run_cartpole_ppo.py)
 shows the complete assembly: environments, networks, learner, logger, evaluator,
-and training call. Existing imports through `deeprl.algorithms.on_policy` and
-`deeprl.training.on_policy` remain supported.
+and training call. The learner contract is in `deeprl.algorithms.on_policy`.
+These are the only on-policy import paths; there are no compatibility shims.
 
 ### Checkpoints and Evaluation
 
 The rollout trainer saves `last.pt` and periodic `step_<transitions>.pt` files
 at completed-update boundaries. Checkpoints include learner/optimizer state,
 trainer-managed preprocessing state, progress, supported Torch RNG state,
-configuration, and version/source metadata. There is no automatic
-best-checkpoint selection.
+configuration, and informational dependency/source provenance. Only the current
+checkpoint contract is supported, without schema versions, migrations, or legacy
+fallbacks. There is no automatic best-checkpoint selection.
 
 Resume restores learning state but starts **fresh environment episodes**;
 it does not restore the simulator's exact trajectory. Evaluation uses frozen

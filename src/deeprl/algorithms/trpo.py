@@ -65,7 +65,6 @@ class TRPOLearner(NPGLearner):
     """NPG with backtracking that enforces the sampled KL constraint."""
 
     algorithm_id = "trpo"
-    legacy_algorithm_ids = ("deeprl.algorithms.trpo.TRPOLearner",)
 
     def __init__(
         self,

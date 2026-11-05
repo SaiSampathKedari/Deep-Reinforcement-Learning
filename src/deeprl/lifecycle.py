@@ -81,8 +81,8 @@ def validate_run_config(
 ) -> None:
     """Check the experiment fields that must match when resuming.
 
-    The caller chooses the fields. Missing saved fields compare as None so
-    older runs can omit optional, disabled preprocessing settings.
+    The caller chooses the fields. Both configurations must contain each field,
+    including explicitly disabled preprocessing settings represented by None.
     """
     if not isinstance(saved_config, Mapping):
         raise ValueError("Checkpoint has no valid experiment configuration.")
@@ -93,7 +93,9 @@ def validate_run_config(
     for name in keys:
         if name not in current:
             raise ValueError(f"Current experiment configuration is missing {name}.")
-        if saved.get(name) != current[name]:
+        if name not in saved:
+            raise ValueError(f"Checkpoint experiment configuration is missing {name}.")
+        if saved[name] != current[name]:
             raise ValueError(f"Checkpoint {name} does not match this experiment.")
 
 

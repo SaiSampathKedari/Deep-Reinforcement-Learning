@@ -52,14 +52,21 @@ def validate_resume_config(
     current_config: Mapping[str, Any],
     *,
     mutable_on_resume: Collection[str],
-    resume_defaults: Mapping[str, Any],
     learning_rate_fields: Mapping[str, str],
 ) -> dict[str, float]:
-    """Check immutable settings and return changed rates by optimizer role."""
+    """Require matching fields, validate settings, and return changed rates."""
+    missing = current_config.keys() - saved_config.keys()
+    unexpected = saved_config.keys() - current_config.keys()
+    if missing or unexpected:
+        raise ValueError(
+            f"checkpoint learner config differs: missing={sorted(missing)}, "
+            f"unexpected={sorted(unexpected)}"
+        )
+
     changed = [
         name for name, value in current_config.items()
         if name not in mutable_on_resume
-        and saved_config.get(name, resume_defaults.get(name)) != value
+        and saved_config[name] != value
     ]
     if changed:
         raise ValueError(f"checkpoint learner config differs: {', '.join(changed)}")
@@ -67,7 +74,7 @@ def validate_resume_config(
     return {
         role: current_config[name]
         for name, role in learning_rate_fields.items()
-        if name in saved_config and saved_config[name] != current_config[name]
+        if saved_config[name] != current_config[name]
     }
 
 
