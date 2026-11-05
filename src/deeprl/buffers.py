@@ -234,8 +234,8 @@ class RolloutBuffer:
     ) -> Iterator[RolloutBatch]:
         """Yield aligned flat batches from one completed rollout.
 
-        GAE outputs are supplied after collection. None yields a full batch;
-        an integer yields shuffled minibatches, including any final remainder.
+        GAE outputs must be on the rollout storage device. None yields a full
+        batch; an integer yields shuffled minibatches, including any remainder.
         """
 
         observations = self.observations
@@ -254,6 +254,12 @@ class RolloutBuffer:
                 f"value_targets must have shape {expected}, "
                 f"got {tuple(value_targets.shape)}"
             )
+
+        for name, tensor in (("advantages", advantages), ("value_targets", value_targets)):
+            if tensor.device != self.rewards.device:
+                raise ValueError(
+                    f"{name} must be on {self.rewards.device}, got {tensor.device}"
+                )
 
         rollout_size = self.rollout_steps * self.num_envs
 
