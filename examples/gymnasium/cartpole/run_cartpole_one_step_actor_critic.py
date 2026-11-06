@@ -1,6 +1,6 @@
 """Train the pedagogical one-step actor-critic on CartPole.
 
-Saved policy/value weights are inference-only, not resumable training checkpoints.
+The exported actor is inference-only, not a resumable training checkpoint.
 """
 
 import argparse
@@ -13,15 +13,24 @@ import gymnasium as gym
 import torch
 from gymnasium.wrappers import RecordVideo
 
-from deeprl.algorithms.one_step_actor_critic import OneStepACConfig, one_step_actor_critic
-from deeprl.checkpoint import save_checkpoint
+from deeprl.algorithms.one_step_actor_critic import (
+    OneStepACConfig,
+    one_step_actor_critic,
+)
+from deeprl.data_spec import DataSpec, FeatureSpec
 from deeprl.env import make_vec_env
 from deeprl.evaluate import Evaluator, evaluate_policy
-from deeprl.lifecycle import config_to_jsonable, seed_torch
+from deeprl.inference import InferencePolicy
+from deeprl.lifecycle import config_to_jsonable, get_provenance, seed_torch
 from deeprl.logger import Logger
 from deeprl.policies import CategoricalPolicy
+from deeprl.policy_io import save_policy
 from deeprl.value import ValueFunction
-from examples.gymnasium.cartpole.cartpole_networks import PolicyNetwork, ValueNetwork
+from examples.gymnasium.cartpole.cartpole_networks import (
+    PolicyNetwork,
+    ValueNetwork,
+    build_policy,
+)
 
 
 ENV_ID = "CartPole-v1"
@@ -42,11 +51,15 @@ DEFAULT_CONFIG = OneStepACConfig(
 
 
 def main() -> None:
+    """Train the educational actor-critic and export its inference policy."""
+    # 0. Resolve config defaults and command-line overrides.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=DEFAULT_CONFIG.seed)
     parser.add_argument("--device", type=torch.device, default=DEFAULT_CONFIG.device)
     parser.add_argument(
-        "--total-timesteps", type=int, default=DEFAULT_CONFIG.total_timesteps,
+        "--total-timesteps",
+        type=int,
+        default=DEFAULT_CONFIG.total_timesteps,
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--no-video", action="store_true")
@@ -60,6 +73,7 @@ def main() -> None:
         device=args.device,
         total_timesteps=args.total_timesteps,
     )
+    # 1. Record resolved settings in a fresh output directory.
     run_config = {
         "env_id": ENV_ID,
         "policy_hidden_sizes": list(HIDDEN_SIZES),
@@ -73,15 +87,20 @@ def main() -> None:
     learner_config = config_to_jsonable(cfg)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     (args.output_dir / "config.json").write_text(
-        json.dumps({
-            "experiment": run_config,
-            "learner": learner_config,
-            "num_envs": NUM_ENVS,
-        }, indent=2) + "\n",
+        json.dumps(
+            {
+                "experiment": run_config,
+                "learner": learner_config,
+                "num_envs": NUM_ENVS,
+            },
+            indent=2,
+        ) + "\n",
         encoding="utf-8",
     )
 
     seed_torch(cfg.seed)  # Initialize networks reproducibly before training.
+
+    # 2. Create environments and logging resources with guaranteed cleanup.
     with ExitStack() as stack:
         envs = make_vec_env(ENV_ID, NUM_ENVS, device=cfg.device)
         stack.callback(envs.close)
@@ -96,10 +115,25 @@ def main() -> None:
                 SummaryWriter(log_dir=str(args.output_dir / "events"))
             )
 
+        # 3. Construct networks and declare unbatched inference features.
+        # Vector batches: (N, obs_dim) observations and (N,) discrete actions.
         obs_dim = envs.single_observation_space.shape[0]
         num_actions = int(envs.single_action_space.n)
         policy = CategoricalPolicy(PolicyNetwork(obs_dim, num_actions, HIDDEN_SIZES))
+        inference_policy = InferencePolicy(policy, deterministic=True)
+        policy_spec = DataSpec(
+            observations=(
+                FeatureSpec(
+                    "state",
+                    tuple(envs.single_observation_space.shape),
+                    envs.single_observation_space.dtype.name,
+                ),
+            ),
+            actions=(FeatureSpec("action", (), "int64"),),
+        )
         value_fn = ValueFunction(ValueNetwork(obs_dim, HIDDEN_SIZES))
+
+        # 4. Configure evaluation and training metrics.
         evaluator = Evaluator(
             eval_env,
             eval_every=EVAL_EVERY,
@@ -108,32 +142,47 @@ def main() -> None:
             seed=run_config["eval_seed"],
         )
         logger = Logger(
-            NUM_ENVS, cfg.log_every, writer, cfg.device,
+            NUM_ENVS,
+            cfg.log_every,
+            writer,
+            cfg.device,
             metrics_path=args.output_dir / "metrics.jsonl",
             total_timesteps=cfg.total_timesteps,
             show_progress=True,
             ev_name="diagnostics/td_target_explained_variance",
         )
         stack.callback(logger.finish)  # Flush before the writer is closed.
+
+        # 5. Run one-step actor and critic updates.
         one_step_actor_critic(
-            envs=envs, policy=policy, value_fn=value_fn, cfg=cfg,
-            logger=logger, evaluator=evaluator,
+            envs=envs,
+            policy=policy,
+            value_fn=value_fn,
+            cfg=cfg,
+            logger=logger,
+            evaluator=evaluator,
         )
 
-    # Keep evaluation-compatible weights without claiming resumable run state.
-    # The one-step API does not expose optimizer, RNG, or continuation state.
-    weights_path = args.output_dir / "weights" / "policy.pt"
-    save_checkpoint(weights_path, {
-        "artifact_type": "inference_weights",
-        "resume_supported": False,
-        "algorithm": "one_step_actor_critic",
-        "learner": {"policy": policy.state_dict(), "value_fn": value_fn.state_dict()},
-        "progress": {"global_step": logger.global_step},
-        "learner_config": learner_config,
-        "config": run_config,
-        "num_envs": NUM_ENVS,
-    })
+    # 6. Export the actor without critic or training continuation state.
+    policy_dir = args.output_dir / "policy"
+    save_policy(
+        policy_dir,
+        inference_policy,
+        spec=policy_spec,
+        model_id=f"{build_policy.__module__}.{build_policy.__name__}",
+        model_config={
+            "obs_dim": obs_dim,
+            "num_actions": num_actions,
+            "hidden_sizes": list(HIDDEN_SIZES),
+        },
+        provenance={
+            **get_provenance(),
+            "env_id": ENV_ID,
+            "training_step": logger.global_step,
+        },
+    )
 
+    # 7. Optionally record final-policy episodes in a separate environment.
     if not args.no_video:
         video_env = gym.make(ENV_ID, render_mode="rgb_array")
         try:
@@ -145,7 +194,8 @@ def main() -> None:
                 disable_logger=True,
             )
             evaluate_policy(
-                video_env, policy,
+                video_env,
+                inference_policy,
                 num_episodes=VIDEO_EPISODES,
                 device=cfg.device,
                 deterministic=True,
@@ -155,7 +205,7 @@ def main() -> None:
             video_env.close()
 
     print(f"Run saved to {args.output_dir}")
-    print(f"Inference-only weights (no resume): {weights_path}")
+    print(f"Inference policy (no resume): {policy_dir}")
 
 
 if __name__ == "__main__":

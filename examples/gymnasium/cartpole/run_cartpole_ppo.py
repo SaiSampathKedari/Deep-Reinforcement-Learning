@@ -12,22 +12,36 @@ import torch
 from deeprl.training.train_on_policy import train_on_policy
 from deeprl.algorithms.ppo import PPOLearner
 from deeprl.checkpoint import load_checkpoint
+from deeprl.data_spec import DataSpec, FeatureSpec
 from deeprl.env import make_vec_env
 from deeprl.evaluate import Evaluator
-from deeprl.lifecycle import config_to_jsonable, seed_torch, validate_run_config
+from deeprl.lifecycle import (
+    config_to_jsonable,
+    get_provenance,
+    seed_torch,
+    validate_run_config,
+)
 from deeprl.logger import Logger
 from deeprl.policies import CategoricalPolicy
+from deeprl.policy_io import describe_policy, save_policy
 from deeprl.value import ValueFunction
 from examples.gymnasium.cartpole import ppo_cartpole_config as settings
-from examples.gymnasium.cartpole.cartpole_networks import PolicyNetwork, ValueNetwork
+from examples.gymnasium.cartpole.cartpole_networks import (
+    PolicyNetwork,
+    ValueNetwork,
+    build_policy,
+)
 
 
 def main() -> None:
-    # Config supplies defaults; command-line arguments override selected values.
+    """Train with resolved settings and export the final inference policy."""
+    # 0. Resolve config defaults and command-line overrides.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=settings.PPO_CONFIG.seed)
     parser.add_argument(
-        "--device", type=torch.device, default=settings.PPO_CONFIG.device
+        "--device",
+        type=torch.device,
+        default=settings.PPO_CONFIG.device,
     )
     parser.add_argument(
         "--total-timesteps",
@@ -45,7 +59,7 @@ def main() -> None:
         total_timesteps=args.total_timesteps,
     )
 
-    # Preserve settings needed to reconstruct and identify this experiment.
+    # 1. Validate resume settings and record the new run.
     run_config = {
         "env_id": settings.ENV_ID,
         "policy_hidden_sizes": list(settings.POLICY_HIDDEN_SIZES),
@@ -83,7 +97,7 @@ def main() -> None:
 
     seed_torch(cfg.seed)  # Seed before initializing network weights.
 
-    # Close environments and flush logging even if training raises an exception.
+    # 2. Create environments and logging resources with guaranteed cleanup.
     with ExitStack() as stack:
         envs = make_vec_env(settings.ENV_ID, settings.NUM_ENVS, device=cfg.device)
         stack.callback(envs.close)
@@ -98,6 +112,8 @@ def main() -> None:
                 SummaryWriter(log_dir=str(args.output_dir / "events"))
             )
 
+        # 3. Construct the models, processors, and learner.
+        # Vector batches: (N, obs_dim) observations and (N,) discrete actions.
         obs_dim = envs.single_observation_space.shape[0]
         num_actions = int(envs.single_action_space.n)
 
@@ -107,6 +123,34 @@ def main() -> None:
         value_fn = ValueFunction(ValueNetwork(obs_dim, settings.VALUE_HIDDEN_SIZES))
         learner = PPOLearner(policy, value_fn, cfg)
 
+        # 4. Describe the actor's inference interface independently of training state.
+        learner.inference_policy.deterministic = True
+        policy_spec = DataSpec(
+            observations=(
+                FeatureSpec(
+                    "state",
+                    tuple(envs.single_observation_space.shape),
+                    envs.single_observation_space.dtype.name,
+                ),
+            ),
+            actions=(FeatureSpec("action", (), "int64"),),
+        )
+        model_id = f"{build_policy.__module__}.{build_policy.__name__}"
+        model_config = {
+            "obs_dim": obs_dim,
+            "num_actions": num_actions,
+            "hidden_sizes": list(settings.POLICY_HIDDEN_SIZES),
+        }
+        provenance = {**get_provenance(), "env_id": settings.ENV_ID}
+        policy_manifest = describe_policy(
+            learner.inference_policy,
+            spec=policy_spec,
+            model_id=model_id,
+            model_config=model_config,
+            provenance=provenance,
+        )
+
+        # 5. Configure evaluation and training metrics.
         evaluator = Evaluator(
             eval_env,
             eval_every=settings.EVAL_EVERY,
@@ -125,6 +169,7 @@ def main() -> None:
         )
         stack.callback(logger.finish)  # Flush metrics before closing the writer.
 
+        # 6. Collect rollouts, update the learner, and save training checkpoints.
         train_on_policy(
             envs=envs,
             learner=learner,
@@ -134,6 +179,21 @@ def main() -> None:
             checkpoint_interval=settings.CHECKPOINT_INTERVAL,
             run_config=run_config,
             resume_from=args.resume_from,
+            policy_manifest=policy_manifest,
+        )
+
+        # 7. Export the completed actor and frozen preprocessing for inference.
+        rollout_size = cfg.rollout_steps * settings.NUM_ENVS
+        save_policy(
+            args.output_dir / "policy",
+            learner.inference_policy,
+            spec=policy_spec,
+            model_id=model_id,
+            model_config=model_config,
+            provenance={
+                **provenance,
+                "training_step": cfg.total_timesteps // rollout_size * rollout_size,
+            },
         )
 
     print(f"Run saved to {args.output_dir}")

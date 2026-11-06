@@ -3,9 +3,22 @@
 import torch
 from torch import nn
 
+from deeprl.policies import CategoricalPolicy
+
+
+def build_policy(config: dict) -> CategoricalPolicy:
+    """Reconstruct the actor from an exported policy's constructor arguments."""
+    return CategoricalPolicy(
+        PolicyNetwork(
+            config["obs_dim"],
+            config["num_actions"],
+            tuple(config["hidden_sizes"]),
+        )
+    )
+
 
 class PolicyNetwork(nn.Module):
-    """Map observations to unnormalized action logits."""
+    """Map (B, obs_dim) observations to (B, num_actions) logits."""
 
     def __init__(
         self,
@@ -36,7 +49,7 @@ class PolicyNetwork(nn.Module):
 
 
 class ValueNetwork(nn.Module):
-    """Map observations to scalar state-value predictions."""
+    """Map (B, obs_dim) observations to (B, 1) state values."""
 
     def __init__(
         self,
