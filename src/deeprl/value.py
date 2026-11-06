@@ -1,9 +1,11 @@
+"""Scalar state-value interface for caller-supplied networks."""
+
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from deeprl.buffers import TensorData
+from deeprl.data_spec import TensorData
 
 
 class ValueFunction(nn.Module):
@@ -14,6 +16,7 @@ class ValueFunction(nn.Module):
         self.value_network = value_network
 
     def forward(self, observations: TensorData) -> torch.Tensor:
+        """Convert network outputs (B, 1) to one value per observation, (B,)."""
         values = self.value_network(observations)
         expected_shape = (observations.shape[0], 1)
 

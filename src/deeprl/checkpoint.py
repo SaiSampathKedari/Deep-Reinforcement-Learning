@@ -4,8 +4,8 @@ Training checkpoints contain learner state, configuration, progress and RNG
 state. Workflows declare additional required fields. Component state and
 preprocessing settings are validated by their owners before restoration.
 
-The resume contract is "continue": restore learning state and start fresh
-environment episodes, not an exact uninterrupted simulator trajectory.
+Resuming restores learning state and starts fresh environment episodes; it
+does not reproduce an uninterrupted simulator trajectory.
 """
 
 from collections.abc import Mapping, Sequence
@@ -16,9 +16,6 @@ from typing import Any
 import torch
 
 from deeprl.stats import TrainingProgress
-
-
-CHECKPOINT_RESUME_CONTRACT = "continue"
 
 
 def get_algorithm_id(learner_type: type) -> str:
@@ -36,7 +33,8 @@ def get_algorithm_id(learner_type: type) -> str:
 
 
 def validate_checkpoint_algorithm(
-    checkpoint: Mapping[str, Any], learner_type: type,
+    checkpoint: Mapping[str, Any],
+    learner_type: type,
 ) -> None:
     """Require the learner's current algorithm identity."""
     if checkpoint.get("algorithm") != get_algorithm_id(learner_type):
@@ -59,7 +57,6 @@ def build_training_checkpoint(
     adds workflow-specific state and validates its required keys before saving.
     """
     checkpoint = {
-        "resume_contract": CHECKPOINT_RESUME_CONTRACT,
         "algorithm": algorithm,
         "learner": learner_state,
         "learner_config": learner_config,
@@ -83,16 +80,18 @@ def validate_training_checkpoint(
     Algorithm-specific configuration rules, tensor contents, and environment
     settings remain the responsibility of the learner and training workflow.
     """
+    # 1. Require the common envelope and any workflow-specific fields.
     if not isinstance(checkpoint, Mapping):
         raise ValueError("checkpoint must be a mapping")
     required = {
         "learner", "progress", "algorithm", "learner_config", "config",
-        "rng_state", "resume_contract", *required_keys,
+        "rng_state", *required_keys,
     }
     missing = required - checkpoint.keys()
     if missing:
         raise ValueError(f"checkpoint is missing required state: {', '.join(sorted(missing))}")
 
+    # 2. Validate learner-state containers and trainer-owned progress counters.
     if not isinstance(checkpoint["learner"], Mapping):
         raise ValueError("checkpoint learner must be a state mapping")
     progress = checkpoint["progress"]
@@ -102,8 +101,7 @@ def validate_training_checkpoint(
         raise ValueError("checkpoint progress must contain global_step, gradient_step, and update")
     TrainingProgress(**progress)
 
-    if checkpoint["resume_contract"] != CHECKPOINT_RESUME_CONTRACT:
-        raise ValueError("unsupported checkpoint resume_contract; only continue is supported")
+    # 3. Check configuration and processing descriptions before restoration.
     if (
         not isinstance(checkpoint["algorithm"], str) or not checkpoint["algorithm"].strip()
     ):
@@ -118,20 +116,22 @@ def validate_training_checkpoint(
         num_envs = checkpoint["num_envs"]
         if type(num_envs) is not int or num_envs <= 0:
             raise ValueError("checkpoint num_envs must be a positive integer")
-    for name in ("obs_normalizer", "reward_scaler"):
-        if name in checkpoint and not isinstance(checkpoint[name], Mapping):
-            raise ValueError(f"checkpoint {name} must be a state mapping")
+    if "observation_processor" in checkpoint and not isinstance(
+        checkpoint["observation_processor"], Mapping
+    ):
+        raise ValueError("checkpoint observation_processor must be a state mapping")
 
     if "preprocessing_config" in checkpoint:
         preprocessing = checkpoint["preprocessing_config"]
         if not isinstance(preprocessing, Mapping) or set(preprocessing) != {
-            "observation", "reward",
+            "observation", "action",
         }:
-            raise ValueError("checkpoint preprocessing_config must contain observation and reward")
+            raise ValueError("checkpoint preprocessing_config must contain observation and action")
         for name, settings in preprocessing.items():
             if settings is not None and not isinstance(settings, Mapping):
                 raise ValueError(f"checkpoint preprocessing_config {name} must be a mapping or None")
 
+    # 4. Require native Torch generator-state tensors for the selected devices.
     rng_state = checkpoint["rng_state"]
     if not isinstance(rng_state, Mapping):
         raise ValueError("checkpoint rng_state must be a mapping")

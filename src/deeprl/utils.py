@@ -1,11 +1,14 @@
+"""Small network-initialization and scalar-diagnostic helpers."""
+
 import torch
 import torch.nn as nn
 
 def layer_init(
-  layer     :   nn.Linear,
-  std       :   float = 2**0.5,
-  bias_const:   float = 0.0,  
+    layer     :   nn.Linear,
+    std       :   float = 2**0.5,
+    bias_const:   float = 0.0,
 ) -> nn.Linear:
+    """Initialize orthogonal weights with the given gain and constant biases."""
     nn.init.orthogonal_(layer.weight, std)
     nn.init.constant_(layer.bias, bias_const)
     return layer
@@ -15,20 +18,20 @@ def mlp(
     output_gain :   float,
     activation  :   type[nn.Module] = nn.Tanh,
 ) -> nn.Sequential:
-    
+    """Build linear layers with hidden activations and a linear output head."""
     layers: list[nn.Module] = []
-    for i in range(len(sizes) -1):
+    for i in range(len(sizes) - 1):
         last = i == len(sizes) - 2
         gain = output_gain if last else 2**0.5
         layers.append(
-            layer_init(nn.Linear(sizes[i], sizes[i+1]), std=gain)
+            layer_init(nn.Linear(sizes[i], sizes[i + 1]), std=gain)
         )
         if not last:
             layers.append(activation())
     return nn.Sequential(*layers)
 
 def grad_norm(module : nn.Module) -> float:
-    
+    """Return the global L2 norm of existing gradients without modifying them."""
     grads = [p.grad for p in module.parameters() if p.grad is not None]
     if not grads:
         return 0.0
@@ -39,7 +42,8 @@ def explained_variance(
     y_pred : torch.Tensor,
     y_true: torch.Tensor
 ) -> float:
+    """Compare equally shaped predictions/targets; constant targets yield NaN."""
     var_true = torch.var(y_true, unbiased=False)
-    if var_true ==0:
+    if var_true == 0:
         return float("nan")
     return float(1 - torch.var(y_true - y_pred, unbiased=False) / var_true)

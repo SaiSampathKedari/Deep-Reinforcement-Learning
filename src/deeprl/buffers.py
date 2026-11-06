@@ -8,7 +8,7 @@ from typing import NamedTuple
 import torch
 from tensordict import LazyStackedTensorDict, TensorDictBase
 
-type TensorData = torch.Tensor | TensorDictBase
+from deeprl.data_spec import TensorData
 
 
 class RolloutBatch(NamedTuple):
@@ -32,7 +32,10 @@ def _allocate_storage(
     leading_shape : tuple[int, ...],
     device        : torch.device,
 ) -> TensorData:
-    """Allocate zeroed storage using the feature structure of a batch."""
+    """Replace the input batch axis with storage axes, preserving each feature.
+
+    ``leading_shape`` is (T, N) for rollout storage or (C,) for replay storage.
+    """
 
     if isinstance(batch, torch.Tensor):
         return torch.zeros(
@@ -41,7 +44,8 @@ def _allocate_storage(
             device=device,
         )
 
-    return batch[0].to(device).expand(*leading_shape).clone().zero_()
+    # TensorDict.clone() may use arithmetic unsupported by unsigned depth leaves.
+    return batch[0].to(device).expand(*leading_shape).apply(torch.zeros_like)
 
 
 def _validate_batch(
@@ -91,6 +95,17 @@ def _validate_batch(
             name=f"{name}.{key}",
             reference=reference[key] if reference is not None else None,
         )
+
+
+def _select_batch(batch: TensorData, indices: torch.Tensor) -> TensorData:
+    """Gather rows with native unsigned-dtype support on CPU and CUDA."""
+    if isinstance(batch, torch.Tensor):
+        # CUDA indexing and CPU rank-one index_select lack uint16 support.
+        return batch.index_select(0, indices) if batch.is_cuda else batch[indices]
+    return batch.apply(
+        lambda leaf: _select_batch(leaf, indices),
+        batch_size=(indices.numel(),),
+    )
 
 
 class RolloutBuffer:
@@ -202,13 +217,19 @@ class RolloutBuffer:
             leading_shape = (self.rollout_steps, self.num_envs)
 
             self.observations = _allocate_storage(
-                observation, leading_shape=leading_shape, device=self.device,
+                observation,
+                leading_shape=leading_shape,
+                device=self.device,
             )
             self.actions = _allocate_storage(
-                action, leading_shape=leading_shape, device=self.device,
+                action,
+                leading_shape=leading_shape,
+                device=self.device,
             )
             self.next_observations = _allocate_storage(
-                next_observation, leading_shape=leading_shape, device=self.device,
+                next_observation,
+                leading_shape=leading_shape,
+                device=self.device,
             )
         assert self.actions is not None
         assert self.next_observations is not None
@@ -283,8 +304,8 @@ class RolloutBuffer:
             batch_indices = indices[start : start + batch_size]
 
             yield RolloutBatch(
-                observations=observations[batch_indices],
-                actions=actions[batch_indices],
+                observations=_select_batch(observations, batch_indices),
+                actions=_select_batch(actions, batch_indices),
                 old_log_probs=old_log_probs[batch_indices],
                 old_values=old_values[batch_indices],
                 advantages=advantages[batch_indices],
@@ -329,7 +350,9 @@ class ReplayBuffer:
 
         # Large replay storage defaults to CPU; sampled batches are transferred
         # to sample_device immediately before an update.
-        self.storage_device = torch.device("cpu") if storage_device is None else storage_device
+        self.storage_device = (
+            torch.device("cpu") if storage_device is None else storage_device
+        )
 
         C = self.capacity
 
@@ -354,6 +377,7 @@ class ReplayBuffer:
 
     @property
     def full(self) -> bool:
+        """Whether all C storage rows are populated and insertion evicts old data."""
         return self.size == self.capacity
 
     def __len__(self) -> int:
@@ -371,7 +395,11 @@ class ReplayBuffer:
         termination     :   torch.Tensor,   # (K,) bool
         truncation      :   torch.Tensor,   # (K,) bool
     ) -> None:
-        """Store K aligned transitions; a single transition needs a batch axis."""
+        """Store K aligned transitions; a single transition needs a batch axis.
+
+        Capacity counts transitions, not vector steps. Rows wrap around and
+        replace the oldest stored transitions when capacity is reached.
+        """
 
         if not isinstance(observation, (torch.Tensor, TensorDictBase)):
             raise TypeError("observation must be a Tensor or TensorDict")
@@ -436,20 +464,20 @@ class ReplayBuffer:
         assert self.actions is not None
         assert self.next_observations is not None
 
-        indices = (
-            self.pos + torch.arange(num_transitions, device=self.storage_device)
-        ) % self.capacity
-
-        # Indexed assignment writes into storage; copy_ on an indexed tensor
-        # would only modify the temporary gathered copy.
-        self.observations[indices] = observation.detach().to(self.storage_device)
-        self.actions[indices] = action.detach().to(self.storage_device)
-        self.next_observations[indices] = next_observation.detach().to(self.storage_device)
-        for _, tensor, storage in scalar_fields:
-            storage[indices] = tensor.detach().to(
-                dtype=storage.dtype,
-                device=storage.device,
-            )
+        # Slice views support uint16 copy_ and need at most two writes per field.
+        first_count = min(num_transitions, self.capacity - self.pos)
+        for batch, storage in (
+            (observation, self.observations),
+            (action, self.actions),
+            (next_observation, self.next_observations),
+            (reward, self.rewards),
+            (termination, self.terminations),
+            (truncation, self.truncations),
+        ):
+            batch = batch.detach().to(self.storage_device)
+            storage[self.pos : self.pos + first_count].copy_(batch[:first_count])
+            if first_count < num_transitions:
+                storage[: num_transitions - first_count].copy_(batch[first_count:])
 
         self.pos = (self.pos + num_transitions) % self.capacity
         self.size = min(self.size + num_transitions, self.capacity)
@@ -462,6 +490,8 @@ class ReplayBuffer:
 
         The requested batch may exceed the current buffer size; in that case,
         transitions can appear more than once in the returned batch.
+        Each feature leaf has leading dimension B=batch_size on sample_device;
+        storage remains on storage_device.
         """
 
         if batch_size <= 0:
@@ -485,10 +515,10 @@ class ReplayBuffer:
         # Gather on the storage device, then transfer only the sampled data to
         # the learner's device.
         return ReplayBatch(
-            observations=self.observations[indices].to(device=self.sample_device),
-            actions=self.actions[indices].to(device=self.sample_device),
+            observations=_select_batch(self.observations, indices).to(device=self.sample_device),
+            actions=_select_batch(self.actions, indices).to(device=self.sample_device),
             rewards=self.rewards[indices].to(device=self.sample_device),
-            next_observations=self.next_observations[indices].to(
+            next_observations=_select_batch(self.next_observations, indices).to(
                 device=self.sample_device
             ),
             terminations=self.terminations[indices].to(device=self.sample_device),

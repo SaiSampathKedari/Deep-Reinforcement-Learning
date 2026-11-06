@@ -10,7 +10,11 @@ import torch.nn as nn
 
 
 class RunningNormalizer(nn.Module):
-    """Standardize features using explicitly updated running statistics."""
+    """Standardize trailing feature axes using explicitly updated statistics.
+
+    ``shape`` excludes leading sample axes. For inputs shaped (T, N, *shape),
+    one update pools T * N samples into feature-shaped mean and variance buffers.
+    """
     
     def __init__(
         self,
@@ -54,7 +58,8 @@ class RunningNormalizer(nn.Module):
             )
         
         x = x.reshape(-1, *self.shape).to(
-            device=self.mean.device, dtype=torch.float64
+            device=self.mean.device,
+            dtype=torch.float64,
         )
         batch_count = x.shape[0]
         if batch_count == 0:
@@ -88,17 +93,26 @@ class RunningNormalizer(nn.Module):
         self.count.copy_(total)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply current statistics without updating them; return float32."""
+        """Apply fitted statistics, or identity before fitting; return float32."""
         normalized = (x.to(torch.float64) - self.mean) / torch.sqrt(
             self.var + self.epsilon
         )
         if self.clip is not None:
             normalized = normalized.clamp(-self.clip, self.clip)
-        return normalized.to(torch.float32)
+        # Unfitted statistics preserve values, including values beyond clip.
+        return torch.where(
+            self.count > 0,
+            normalized,
+            x.to(torch.float64),
+        ).to(torch.float32)
 
 
 class RewardScaler(nn.Module):
-    """Scale rewards by return std, optionally updating per step and clipping."""
+    """Scale chronological (T, N) rewards by running discounted-return std.
+
+    Each environment has its own episode accumulator; all N environments share
+    the scalar running return statistics used for scaling.
+    """
 
     def __init__(
         self,
@@ -143,6 +157,17 @@ class RewardScaler(nn.Module):
             torch.zeros(num_envs, dtype=torch.float64),
             persistent=False,
         )
+
+    @property
+    def config(self) -> dict[str, int | float | bool | None]:
+        """Settings needed to interpret the saved running return statistics."""
+        return {
+            "num_envs": self.returns.numel(),
+            "gamma": self.gamma,
+            "epsilon": self.epsilon,
+            "update_per_step": self.update_per_step,
+            "clip": self.clip,
+        }
 
     @torch.no_grad()
     def forward(

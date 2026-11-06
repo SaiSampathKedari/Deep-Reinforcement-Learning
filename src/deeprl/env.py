@@ -1,3 +1,5 @@
+"""Gymnasium boundaries for fixed-shape tensor data and explicit vector resets."""
+
 import gymnasium as gym
 import torch
 from gymnasium.envs.registration import VectorizeMode
@@ -5,7 +7,7 @@ from gymnasium.vector import AutoresetMode, VectorEnv
 from gymnasium.wrappers.vector.numpy_to_torch import NumpyToTorch
 from tensordict import TensorDict, TensorDictBase
 
-from deeprl.buffers import TensorData
+from deeprl.data_spec import TensorData
 
 
 def to_tensor_data(
@@ -73,7 +75,11 @@ def make_vec_env(
     device              : torch.device = torch.device("cpu"),
     vectorization_mode  : VectorizeMode = VectorizeMode.SYNC,
 ) -> VectorEnv:
+    """Create N environments with Torch outputs and caller-controlled resets.
 
+    Observations/actions retain their feature structure. Scalar step outputs
+    such as rewards and termination flags have shape (N,).
+    """
     if num_envs <= 0:
         raise ValueError(
             f"num_envs must be positive, got {num_envs}"
@@ -82,7 +88,7 @@ def make_vec_env(
     envs = gym.make_vec(
         env_id,
         num_envs=num_envs,
-        vectorization_mode= vectorization_mode,
+        vectorization_mode=vectorization_mode,
         vector_kwargs={
             "autoreset_mode": AutoresetMode.DISABLED,
         },

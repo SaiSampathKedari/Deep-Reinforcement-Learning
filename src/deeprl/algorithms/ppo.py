@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
     from deeprl.evaluate import Evaluator
     from deeprl.normalization import RewardScaler
+    from deeprl.processors import ActionProcessor, ObservationProcessor
 
 @dataclass(frozen=True)
 class PPOConfig(OnPolicyConfig):
@@ -117,10 +118,21 @@ class PPOLearner(OnPolicyLearner):
         policy      :   nn.Module,
         value_fn    :   nn.Module,
         cfg         :   PPOConfig,
+        *,
+        obs_processor: ObservationProcessor | None = None,
+        action_processor: ActionProcessor | None = None,
+        reward_scaler: RewardScaler | None = None,
     ) -> None:
         if cfg.normalize_value_targets and cfg.value_clip_range is not None:
             raise ValueError("value-target normalization cannot be combined with value clipping")
-        super().__init__(policy, value_fn, cfg)
+        super().__init__(
+            policy,
+            value_fn,
+            cfg,
+            obs_processor=obs_processor,
+            action_processor=action_processor,
+            reward_scaler=reward_scaler,
+        )
         self.cfg: PPOConfig = cfg
         self.value_target_stats = (
             RunningNormalizer((), clip=None).to(cfg.device)
@@ -153,13 +165,21 @@ class PPOLearner(OnPolicyLearner):
         }
         if self.value_target_stats is not None:
             state["value_target_stats"] = self.value_target_stats.state_dict()
+        if self.reward_scaler is not None:
+            state["reward_scaler"] = {
+                "config": self.reward_scaler.config,
+                "state_dict": self.reward_scaler.state_dict(),
+            }
         return state
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         """Validate checkpoint keys before restoring existing components."""
+        self.validate_reward_scaler_state(state)
         expected_keys = {"policy", "value_fn", "optim_actor", "optim_critic"}
         if self.value_target_stats is not None:
             expected_keys.add("value_target_stats")
+        if self.reward_scaler is not None:
+            expected_keys.add("reward_scaler")
         learner_state.validate_state_keys(state, expected_keys)
         self.policy.load_state_dict(state["policy"])
         self.value_fn.load_state_dict(state["value_fn"])
@@ -167,6 +187,8 @@ class PPOLearner(OnPolicyLearner):
         self.optim_critic.load_state_dict(state["optim_critic"])
         if self.value_target_stats is not None:
             self.value_target_stats.load_state_dict(state["value_target_stats"])
+        if self.reward_scaler is not None:
+            self.reward_scaler.load_state_dict(state["reward_scaler"]["state_dict"])
 
     def apply_resume_overrides(self, overrides: dict[str, Any]) -> None:
         """Apply changed learning rates after restoring optimizer state."""
@@ -183,7 +205,11 @@ class PPOLearner(OnPolicyLearner):
         advantages      :   torch.Tensor,
         value_targets   :   torch.Tensor,
     ) -> TrainingStats:
-        """Optimize the policy and critic over one completed rollout."""
+        """Optimize one rollout using fixed advantages/value targets shaped (T, N).
+
+        Each epoch reshuffles B = T * N transitions into minibatches of M.
+        Likelihoods, ratios and advantage weights have shape (M,) within a batch.
+        """
 
         # ------------------------------------------------------------------
         # 0. Setup
@@ -205,7 +231,9 @@ class PPOLearner(OnPolicyLearner):
             "grads/value_norm",
         )
         metric_sums = torch.zeros(
-            len(metric_names), dtype=advantages.dtype, device=self.cfg.device
+            len(metric_names),
+            dtype=advantages.dtype,
+            device=self.cfg.device,
         )
         num_samples = 0
         gradient_steps = 0
@@ -241,9 +269,9 @@ class PPOLearner(OnPolicyLearner):
 
                 # Re-evaluate pi_theta(.|S), log pi_theta(A|S), and V_phi(S)
                 # under the latest parameters. Each scalar output has shape (M,).
-                action_distributions: Distribution = self.policy(batch.observations)
+                action_distributions: Distribution = self.inference_policy(batch.observations)
                 log_probs: torch.Tensor = action_distributions.log_prob(batch.actions)
-                values: torch.Tensor = self.value_fn(batch.observations)
+                values: torch.Tensor = self.evaluate_values(batch.observations)
                 batch_advantages = batch.advantages
                 if (
                     self.cfg.normalize_advantage
@@ -306,7 +334,8 @@ class PPOLearner(OnPolicyLearner):
                 objective_log_ratios = log_ratios
                 if self.cfg.log_ratio_clip is not None:
                     objective_log_ratios = log_ratios.clamp(
-                        -self.cfg.log_ratio_clip, self.cfg.log_ratio_clip,
+                        -self.cfg.log_ratio_clip,
+                        self.cfg.log_ratio_clip,
                     )
                 ratios = torch.exp(objective_log_ratios)
 
@@ -434,14 +463,24 @@ class PPOLearner(OnPolicyLearner):
             with torch.no_grad(), torch.random.fork_rng(devices=fork_devices):
                 for start in range(0, rollout_size, self.cfg.batch_size):
                     stop = start + self.cfg.batch_size
-                    distribution = self.policy(observations[start:stop])
+                    distribution = self.inference_policy(observations[start:stop])
                     log_ratio = (
                         distribution.log_prob(actions[start:stop]) - old_log_probs[start:stop]
                     )
                     final_kl_sum = final_kl_sum + (log_ratio.exp() - 1 - log_ratio).sum()
-                    if isinstance(distribution, Independent) and isinstance(distribution.base_dist, Normal):
+                    if (
+                        isinstance(distribution, Independent)
+                        and isinstance(distribution.base_dist, Normal)
+                    ):
+                        # Mean/std retain action dimensions: (M, *action_shape).
                         std, mean_abs = distribution.stddev, distribution.mean.abs()
-                        current = torch.stack((std.sum(), std.min(), std.max(), mean_abs.sum(), mean_abs.max()))
+                        current = torch.stack((
+                            std.sum(),
+                            std.min(),
+                            std.max(),
+                            mean_abs.sum(),
+                            mean_abs.max(),
+                        ))
                         if gaussian_stats is None:
                             gaussian_stats = current
                         else:
@@ -498,12 +537,21 @@ def ppo(
     checkpoint_interval: int | None = None,
     run_config: dict[str, Any] | None = None,
     resume_from: str | Path | None = None,
-    obs_normalizer: RunningNormalizer | None = None,
+    policy_manifest: dict[str, Any] | None = None,
     reward_scaler: RewardScaler | None = None,
+    obs_processor: ObservationProcessor | None = None,
+    action_processor: ActionProcessor | None = None,
 ) -> MetricHistory:
     """Construct a PPO learner and run the shared on-policy training loop."""
 
-    learner = PPOLearner(policy, value_fn, cfg)
+    learner = PPOLearner(
+        policy,
+        value_fn,
+        cfg,
+        obs_processor=obs_processor,
+        action_processor=action_processor,
+        reward_scaler=reward_scaler,
+    )
 
     return train_on_policy(
         envs=envs,
@@ -515,6 +563,5 @@ def ppo(
         checkpoint_interval=checkpoint_interval,
         run_config=run_config,
         resume_from=resume_from,
-        obs_normalizer=obs_normalizer,
-        reward_scaler=reward_scaler,
+        policy_manifest=policy_manifest,
     )

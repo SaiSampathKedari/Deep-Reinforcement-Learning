@@ -3,36 +3,17 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
 import gymnasium as gym
 import torch
 import torch.nn as nn
-from torch.distributions import Distribution
 
-from deeprl.buffers import TensorData
 from deeprl.env import from_tensor_data, to_tensor_data
 from deeprl.logger import Logger
 from deeprl.stats import TrainingProgress
-
-
-def _evaluation_action(
-    distribution: Distribution,
-    *,
-    deterministic: bool,
-) -> TensorData:
-    if torch.is_tensor(distribution):
-        raise TypeError(
-            "tensor-valued actors and Q-functions require an explicit action_fn"
-        )
-    if not deterministic:
-        return distribution.sample()
-    try:
-        return distribution.mode
-    except NotImplementedError:
-        return distribution.mean
 
 
 @torch.no_grad()
@@ -44,17 +25,22 @@ def evaluate_policy(
     device: torch.device,
     deterministic: bool,
     seed: int,
-    action_fn: Callable[[TensorData, bool], TensorData] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Evaluate episodes while preserving default CPU/selected-CUDA Torch RNG.
 
-    By default, policy returns a distribution. An explicit action_fn instead
-    receives (batched_observations, deterministic) and returns batched actions.
-    It must use policy or its submodules so evaluation mode is managed here.
+    The policy must be an nn.Module with an act(observations, deterministic=...)
+    method returning batched environment commands. InferencePolicy supplies this
+    interface; custom modules can implement it without inheriting another base.
     Python, NumPy, and custom generator state are outside this RNG guarantee.
+    Returns two CPU tensors shaped (num_episodes,): raw returns and lengths.
     """
+    # 0. Validate the inference interface and preserve every module's mode.
     if num_episodes <= 0:
         raise ValueError(f"num_episodes must be positive, got {num_episodes}")
+    if not isinstance(policy, nn.Module) or not callable(getattr(policy, "act", None)):
+        raise TypeError("evaluation policy must be an nn.Module with an act method")
+    if not isinstance(deterministic, bool):
+        raise TypeError("deterministic must be boolean")
 
     returns = torch.empty(num_episodes, dtype=torch.float32)
     lengths = torch.empty(num_episodes, dtype=torch.int64)
@@ -64,6 +50,7 @@ def evaluate_policy(
     policy.eval()
 
     try:
+        # 1. Isolate evaluation randomness from the training RNG stream.
         # Stochastic evaluation should be repeatable without consuming the RNG
         # stream used by the training policy after evaluation returns.
         fork_devices: list[int] = []
@@ -82,6 +69,7 @@ def evaluate_policy(
                 with torch.cuda.device(fork_devices[0]):
                     torch.cuda.manual_seed(seed)
                     
+            # 2. Run fresh episodes; the policy receives a batch of one.
             for episode in range(num_episodes):
                 observation, _ = env.reset(seed=seed + episode)
                 episode_return = 0.0
@@ -90,13 +78,8 @@ def evaluate_policy(
 
                 while not done:
                     observation_tensor = to_tensor_data(observation, device=device)
-                    if action_fn is None:
-                        action = _evaluation_action(
-                            policy(observation_tensor),
-                            deterministic=deterministic,
-                        )
-                    else:
-                        action = action_fn(observation_tensor, deterministic)
+                    # Actions are (1,) for Discrete or (1, *action_shape) for Box.
+                    action = policy.act(observation_tensor, deterministic=deterministic)
                     action = to_tensor_data(action, batch_size=1)
                     if len(action.shape) == 0 or action.shape[0] != 1:
                         raise ValueError("evaluation actions must have leading batch dimension 1")
@@ -111,6 +94,7 @@ def evaluate_policy(
                 returns[episode] = episode_return
                 lengths[episode] = episode_length
     finally:
+        # 3. Restore mixed train/eval modes, including when inference fails.
         for module, was_training in training_modes:
             module.training = was_training
 
@@ -128,7 +112,6 @@ class Evaluator:
         num_episodes: int,
         device: torch.device,
         seed: int,
-        action_fn: Callable[[TensorData, bool], TensorData] | None = None,
         modes: Sequence[Literal["deterministic", "stochastic"]] = (
             "deterministic", "stochastic",
         ),
@@ -152,7 +135,6 @@ class Evaluator:
         self.num_episodes = num_episodes
         self.device = device
         self.seed = seed
-        self.action_fn = action_fn
         self.modes = modes
         self._next_eval_step = eval_every
         self._last_eval_step: int | None = None
@@ -163,8 +145,13 @@ class Evaluator:
         self._last_eval_step = None
 
     def _evaluate(
-        self, policy: nn.Module, logger: Logger, *, progress: TrainingProgress
+        self,
+        policy: nn.Module,
+        logger: Logger,
+        *,
+        progress: TrainingProgress,
     ) -> None:
+        """Evaluate each requested mode on the same seeded episodes and report it."""
         for mode in self.modes:
             deterministic = mode == "deterministic"
             returns, lengths = evaluate_policy(
@@ -174,18 +161,24 @@ class Evaluator:
                 device=self.device,
                 deterministic=deterministic,
                 seed=self.seed,
-                action_fn=self.action_fn,
             )
             logger.log_evaluation(
                 returns,
                 lengths,
                 progress=progress,
                 deterministic=deterministic,
+                episode_seeds=tuple(
+                    self.seed + episode for episode in range(self.num_episodes)
+                ),
             )
         self._last_eval_step = progress.global_step
 
     def maybe_evaluate(
-        self, policy: nn.Module, logger: Logger, *, progress: TrainingProgress
+        self,
+        policy: nn.Module,
+        logger: Logger,
+        *,
+        progress: TrainingProgress,
     ) -> None:
         """Evaluate once after crossing one or more scheduled checkpoints."""
         if progress.global_step < self._next_eval_step:
@@ -197,7 +190,11 @@ class Evaluator:
             self._next_eval_step += self.eval_every
 
     def evaluate_now(
-        self, policy: nn.Module, logger: Logger, *, progress: TrainingProgress
+        self,
+        policy: nn.Module,
+        logger: Logger,
+        *,
+        progress: TrainingProgress,
     ) -> None:
         """Evaluate the final policy unless it was evaluated at this step."""
         if self._last_eval_step != progress.global_step:
@@ -235,7 +232,10 @@ def bootstrap_ci(
     confidence: float = 0.95,
     seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Bootstrap seed-level curves and return pointwise confidence bounds."""
+    """Bootstrap curves (num_seeds, num_points) into two bounds (num_points,).
+
+    Resample whole seed curves, not individual episodes or time points.
+    """
     if curves.ndim != 2 or curves.shape[0] == 0:
         raise ValueError("curves must have shape (num_seeds, num_points)")
     if num_bootstrap <= 0:

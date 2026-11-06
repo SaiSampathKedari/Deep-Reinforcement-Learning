@@ -28,7 +28,8 @@ if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter
 
     from deeprl.evaluate import Evaluator
-    from deeprl.normalization import RewardScaler, RunningNormalizer
+    from deeprl.normalization import RewardScaler
+    from deeprl.processors import ActionProcessor, ObservationProcessor
 
 
 @dataclass(frozen=True)
@@ -83,8 +84,19 @@ class A2CLearner(OnPolicyLearner):
         policy      :   nn.Module,
         value_fn    :   nn.Module,
         cfg         :   A2CConfig,
+        *,
+        obs_processor: ObservationProcessor | None = None,
+        action_processor: ActionProcessor | None = None,
+        reward_scaler: RewardScaler | None = None,
     ) -> None:
-        super().__init__(policy, value_fn, cfg)
+        super().__init__(
+            policy,
+            value_fn,
+            cfg,
+            obs_processor=obs_processor,
+            action_processor=action_processor,
+            reward_scaler=reward_scaler,
+        )
         self.cfg: A2CConfig = cfg
         self.configure_optimizers()
     
@@ -107,22 +119,32 @@ class A2CLearner(OnPolicyLearner):
     
     def state_dict(self) -> dict[str, Any]:
         """Return network and optimizer states under their checkpoint keys."""
-        return {
+        state = {
             "policy": self.policy.state_dict(),
             "value_fn": self.value_fn.state_dict(),
             "optim_actor": self.optim_actor.state_dict(),
             "optim_critic": self.optim_critic.state_dict(),
         }
+        if self.reward_scaler is not None:
+            state["reward_scaler"] = {
+                "config": self.reward_scaler.config,
+                "state_dict": self.reward_scaler.state_dict(),
+            }
+        return state
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         """Validate checkpoint keys before restoring existing components."""
-        learner_state.validate_state_keys(
-            state, {"policy", "value_fn", "optim_actor", "optim_critic"}
-        )
+        self.validate_reward_scaler_state(state)
+        expected_keys = {"policy", "value_fn", "optim_actor", "optim_critic"}
+        if self.reward_scaler is not None:
+            expected_keys.add("reward_scaler")
+        learner_state.validate_state_keys(state, expected_keys)
         self.policy.load_state_dict(state["policy"])
         self.value_fn.load_state_dict(state["value_fn"])
         self.optim_actor.load_state_dict(state["optim_actor"])
         self.optim_critic.load_state_dict(state["optim_critic"])
+        if self.reward_scaler is not None:
+            self.reward_scaler.load_state_dict(state["reward_scaler"]["state_dict"])
 
     def apply_resume_overrides(self, overrides: dict[str, Any]) -> None:
         """Apply changed learning rates after restoring optimizer state."""
@@ -179,13 +201,13 @@ class A2CLearner(OnPolicyLearner):
 
             # batch_size=None yields the complete flattened rollout, B = T * N.
             # Observations: (B, *obs_shape); actions: (B, *action_shape).
-            action_distributions: Distribution = self.policy(batch.observations)
+            action_distributions: Distribution = self.inference_policy(batch.observations)
 
             # Recompute log pi(A|S) under the current policy. Shape: (B,).
             log_probs = action_distributions.log_prob(batch.actions)
 
             # Recompute V(S) with gradients enabled. Shape: (B,).
-            values: torch.Tensor = self.value_fn(batch.observations)
+            values: torch.Tensor = self.evaluate_values(batch.observations)
 
             # --------------------------------------------------------------
             # 2. Loss computation
@@ -289,8 +311,10 @@ def a2c(
     checkpoint_interval: int | None = None,
     run_config: dict[str, Any] | None = None,
     resume_from: str | Path | None = None,
-    obs_normalizer: RunningNormalizer | None = None,
+    policy_manifest: dict[str, Any] | None = None,
     reward_scaler: RewardScaler | None = None,
+    obs_processor: ObservationProcessor | None = None,
+    action_processor: ActionProcessor | None = None,
 ) -> MetricHistory:
     """Train policy and value networks using synchronous A2C.
 
@@ -298,7 +322,14 @@ def a2c(
     update over each rollout through the shared on-policy training engine.
     """
 
-    learner = A2CLearner(policy, value_fn, cfg)
+    learner = A2CLearner(
+        policy,
+        value_fn,
+        cfg,
+        obs_processor=obs_processor,
+        action_processor=action_processor,
+        reward_scaler=reward_scaler,
+    )
 
     return train_on_policy(
         envs=envs,
@@ -310,6 +341,5 @@ def a2c(
         checkpoint_interval=checkpoint_interval,
         run_config=run_config,
         resume_from=resume_from,
-        obs_normalizer=obs_normalizer,
-        reward_scaler=reward_scaler,
+        policy_manifest=policy_manifest,
     )

@@ -30,7 +30,8 @@ if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter
 
     from deeprl.evaluate import Evaluator
-    from deeprl.normalization import RewardScaler, RunningNormalizer
+    from deeprl.normalization import RewardScaler
+    from deeprl.processors import ActionProcessor, ObservationProcessor
 
 
 def _flat_grad(
@@ -177,9 +178,20 @@ class NPGLearner(OnPolicyLearner):
         policy      :   nn.Module,
         value_fn    :   nn.Module,
         cfg         :   NPGConfig,
+        *,
+        obs_processor: ObservationProcessor | None = None,
+        action_processor: ActionProcessor | None = None,
+        reward_scaler: RewardScaler | None = None,
     ) -> None:
         """Store the networks and initialize NPG-specific optimization state."""
-        super().__init__(policy, value_fn, cfg)
+        super().__init__(
+            policy,
+            value_fn,
+            cfg,
+            obs_processor=obs_processor,
+            action_processor=action_processor,
+            reward_scaler=reward_scaler,
+        )
         self.cfg: NPGConfig = cfg
 
         # Preserve one fixed parameter order for flattened gradients and steps.
@@ -210,20 +222,30 @@ class NPGLearner(OnPolicyLearner):
 
     def state_dict(self) -> dict[str, Any]:
         """Return network and critic optimizer states."""
-        return {
+        state = {
             "policy": self.policy.state_dict(),
             "value_fn": self.value_fn.state_dict(),
             "optim_critic": self.optim_critic.state_dict(),
         }
+        if self.reward_scaler is not None:
+            state["reward_scaler"] = {
+                "config": self.reward_scaler.config,
+                "state_dict": self.reward_scaler.state_dict(),
+            }
+        return state
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         """Validate checkpoint keys before restoring existing components."""
-        learner_state.validate_state_keys(
-            state, {"policy", "value_fn", "optim_critic"}
-        )
+        self.validate_reward_scaler_state(state)
+        expected_keys = {"policy", "value_fn", "optim_critic"}
+        if self.reward_scaler is not None:
+            expected_keys.add("reward_scaler")
+        learner_state.validate_state_keys(state, expected_keys)
         self.policy.load_state_dict(state["policy"])
         self.value_fn.load_state_dict(state["value_fn"])
         self.optim_critic.load_state_dict(state["optim_critic"])
+        if self.reward_scaler is not None:
+            self.reward_scaler.load_state_dict(state["reward_scaler"]["state_dict"])
 
     def apply_resume_overrides(self, overrides: dict[str, Any]) -> None:
         """Apply a changed critic rate after restoring optimizer state."""
@@ -241,7 +263,7 @@ class NPGLearner(OnPolicyLearner):
         The ratio compares the current policy with the rollout policy.
         """
         # Re-evaluate the rollout actions under the current policy.
-        action_distribution : Distribution = self.policy(batch.observations)
+        action_distribution : Distribution = self.inference_policy(batch.observations)
         log_probs : torch.Tensor = action_distribution.log_prob(batch.actions)
 
         # importance_ratio = current_action_probability / rollout_probability
@@ -257,7 +279,7 @@ class NPGLearner(OnPolicyLearner):
         reference_distribution :   Distribution,
     ) -> torch.Tensor:
         """Return mean[KL(reference_policy || current_policy)]."""
-        current_distribution: Distribution = self.policy(observations)
+        current_distribution: Distribution = self.inference_policy(observations)
 
         return kl_divergence(
             reference_distribution,
@@ -376,7 +398,7 @@ class NPGLearner(OnPolicyLearner):
             # Freeze the policy distribution at the base point. It defines the
             # local KL divergence and Fisher matrix for this minibatch.
             with torch.no_grad():
-                reference_distribution: Distribution = self.policy(
+                reference_distribution: Distribution = self.inference_policy(
                     batch.observations
                 )
 
@@ -386,7 +408,7 @@ class NPGLearner(OnPolicyLearner):
 
             # value_loss = 0.5 * mean[(value_target - current_value)^2]
             # The targets are fixed, so gradients flow only through current values.
-            values : torch.Tensor = self.value_fn(batch.observations)
+            values : torch.Tensor = self.evaluate_values(batch.observations)
             value_loss = 0.5 * (batch.value_targets - values).square().mean()
 
             self.optim_critic.zero_grad(set_to_none=True)
@@ -494,7 +516,7 @@ class NPGLearner(OnPolicyLearner):
 
             # Measure the updated policy without retaining another graph.
             with torch.no_grad():
-                updated_distribution: Distribution = self.policy(
+                updated_distribution: Distribution = self.inference_policy(
                     batch.observations
                 )
                 entropy = updated_distribution.entropy().mean()
@@ -569,11 +591,20 @@ def npg(
     checkpoint_interval: int | None = None,
     run_config: dict[str, Any] | None = None,
     resume_from: str | Path | None = None,
-    obs_normalizer: RunningNormalizer | None = None,
+    policy_manifest: dict[str, Any] | None = None,
     reward_scaler: RewardScaler | None = None,
+    obs_processor: ObservationProcessor | None = None,
+    action_processor: ActionProcessor | None = None,
 ) -> MetricHistory:
     """Construct an NPG learner and run the shared on-policy training loop."""
-    learner = NPGLearner(policy, value_fn, cfg)
+    learner = NPGLearner(
+        policy,
+        value_fn,
+        cfg,
+        obs_processor=obs_processor,
+        action_processor=action_processor,
+        reward_scaler=reward_scaler,
+    )
 
     return train_on_policy(
         envs=envs,
@@ -585,6 +616,5 @@ def npg(
         checkpoint_interval=checkpoint_interval,
         run_config=run_config,
         resume_from=resume_from,
-        obs_normalizer=obs_normalizer,
-        reward_scaler=reward_scaler,
+        policy_manifest=policy_manifest,
     )

@@ -26,7 +26,8 @@ if TYPE_CHECKING:
     from torch.utils.tensorboard import SummaryWriter
 
     from deeprl.evaluate import Evaluator
-    from deeprl.normalization import RewardScaler, RunningNormalizer
+    from deeprl.normalization import RewardScaler
+    from deeprl.processors import ActionProcessor, ObservationProcessor
 
 
 @dataclass(frozen=True)
@@ -71,9 +72,20 @@ class TRPOLearner(NPGLearner):
         policy      :   nn.Module,
         value_fn    :   nn.Module,
         cfg         :   TRPOConfig,
+        *,
+        obs_processor: ObservationProcessor | None = None,
+        action_processor: ActionProcessor | None = None,
+        reward_scaler: RewardScaler | None = None,
     ) -> None:
         """Store the networks and refine the inherited configuration type."""
-        super().__init__(policy, value_fn, cfg)
+        super().__init__(
+            policy,
+            value_fn,
+            cfg,
+            obs_processor=obs_processor,
+            action_processor=action_processor,
+            reward_scaler=reward_scaler,
+        )
         self.cfg: TRPOConfig = cfg
 
     @torch.no_grad()
@@ -153,11 +165,20 @@ def trpo(
     checkpoint_interval: int | None = None,
     run_config      : dict[str, Any] | None = None,
     resume_from     : str | Path | None = None,
-    obs_normalizer  : RunningNormalizer | None = None,
+    policy_manifest : dict[str, Any] | None = None,
     reward_scaler   : RewardScaler | None = None,
+    obs_processor  : ObservationProcessor | None = None,
+    action_processor: ActionProcessor | None = None,
 ) -> MetricHistory:
     """Construct a TRPO learner and run the shared on-policy training loop."""
-    learner = TRPOLearner(policy, value_fn, cfg)
+    learner = TRPOLearner(
+        policy,
+        value_fn,
+        cfg,
+        obs_processor=obs_processor,
+        action_processor=action_processor,
+        reward_scaler=reward_scaler,
+    )
 
     return train_on_policy(
         envs=envs,
@@ -169,6 +190,5 @@ def trpo(
         checkpoint_interval=checkpoint_interval,
         run_config=run_config,
         resume_from=resume_from,
-        obs_normalizer=obs_normalizer,
-        reward_scaler=reward_scaler,
+        policy_manifest=policy_manifest,
     )

@@ -33,12 +33,20 @@ def get_provenance() -> dict[str, str | bool | None]:
         if package_dir.parent.name != "src" or not (root / ".git").exists():
             return provenance
         commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=root, check=True,
-            capture_output=True, text=True, timeout=2,
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
         ).stdout.strip()
         status = subprocess.run(
-            ["git", "status", "--porcelain"], cwd=root, check=True,
-            capture_output=True, text=True, timeout=2,
+            ["git", "status", "--porcelain"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return provenance
@@ -47,6 +55,7 @@ def get_provenance() -> dict[str, str | bool | None]:
 
 
 def _config_json_default(value: Any) -> Any:
+    """Encode non-JSON configuration values as descriptions, not live objects."""
     if isinstance(value, type):
         return f"{value.__module__}.{value.__qualname__}"
     if isinstance(value, (torch.device, Path)):
@@ -109,7 +118,8 @@ def seed_torch(seed: int) -> None:
 
 
 def get_rng_state(
-    *, device: str | torch.device = "cpu",
+    *,
+    device: str | torch.device = "cpu",
 ) -> dict[str, torch.Tensor | None]:
     """Capture the default CPU generator and, for CUDA, the selected device.
 
@@ -124,7 +134,9 @@ def get_rng_state(
 
 
 def set_rng_state(
-    state: Mapping[str, Any], *, device: str | torch.device = "cpu",
+    state: Mapping[str, Any],
+    *,
+    device: str | torch.device = "cpu",
 ) -> None:
     """Restore default generators onto the run's explicitly selected device.
 

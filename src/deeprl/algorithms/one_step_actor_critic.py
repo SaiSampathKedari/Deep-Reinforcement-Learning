@@ -15,6 +15,7 @@ from gymnasium.vector import AutoresetMode, VectorEnv
 from torch.distributions import Distribution
 
 from deeprl.env import from_tensor_data, to_tensor_data
+from deeprl.inference import InferencePolicy
 from deeprl.lifecycle import seed_torch
 from deeprl.logger import Logger, MetricHistory
 from deeprl.stats import TrainingProgress, TrainingStats
@@ -66,7 +67,7 @@ def one_step_actor_critic(
 
 
     # ------------------------------------------------------------------
-    # Setup
+    # 0. Setup
     # ------------------------------------------------------------------
 
     if logger is not None:
@@ -90,6 +91,7 @@ def one_step_actor_critic(
     seed_torch(cfg.seed)
     policy   = policy.to(device=cfg.device)
     value_fn = value_fn.to(device=cfg.device)
+    inference_policy = InferencePolicy(policy)
 
     # Construct optimizers after the networks are moved to their device.
     optim_actor = cfg.actor_optimizer_class(
@@ -106,7 +108,11 @@ def one_step_actor_critic(
     # Initial observation batch.
     # Each leaf has shape (N, *observation_shape).
     obs, _ = envs.reset(seed=cfg.seed)
-    obs = to_tensor_data(obs, batch_size=envs.num_envs, device=cfg.device)
+    obs = to_tensor_data(
+        obs,
+        batch_size=envs.num_envs,
+        device=cfg.device,
+    )
 
     # Per-environment I_t = gamma^t.
     # Each environment can be at a different time within its episode.
@@ -133,7 +139,9 @@ def one_step_actor_critic(
         # Structured distributions accept TensorDict actions in log_prob(),
         # matching the canonical actions used by rollout-based updates.
         actions = to_tensor_data(
-            action_dist.sample(), batch_size=envs.num_envs, device=cfg.device
+            action_dist.sample(),
+            batch_size=envs.num_envs,
+            device=cfg.device,
         )
 
         # Differentiable w.r.t. policy parameters.
@@ -153,8 +161,15 @@ def one_step_actor_critic(
         next_obs, rewards, terminations, truncations, _ = envs.step(
             from_tensor_data(actions, envs.single_action_space)
         )
-        progress = replace(progress, global_step=progress.global_step + envs.num_envs)
-        next_obs = to_tensor_data(next_obs, batch_size=envs.num_envs, device=cfg.device)
+        progress = replace(
+            progress,
+            global_step=progress.global_step + envs.num_envs,
+        )
+        next_obs = to_tensor_data(
+            next_obs,
+            batch_size=envs.num_envs,
+            device=cfg.device,
+        )
 
         # Each environment episode finishes through either termination
         # or truncation. Shape: (N,), dtype: bool.
@@ -258,7 +273,7 @@ def one_step_actor_critic(
         )
         logger.maybe_dump()
         if evaluator is not None:
-            evaluator.maybe_evaluate(policy, logger, progress=progress)
+            evaluator.maybe_evaluate(inference_policy, logger, progress=progress)
 
         # --------------------------------------------------------------
         # 6. Update discounts
@@ -283,7 +298,11 @@ def one_step_actor_critic(
             # - reset observations for completed environments;
             # - unchanged next_obs entries for continuing environments.
             obs, _ = envs.reset(options={"reset_mask": dones})
-            obs = to_tensor_data(obs, batch_size=envs.num_envs, device=cfg.device)
+            obs = to_tensor_data(
+                obs,
+                batch_size=envs.num_envs,
+                device=cfg.device,
+            )
 
         else:
 
@@ -292,7 +311,7 @@ def one_step_actor_critic(
             obs = next_obs
 
     if evaluator is not None:
-        evaluator.evaluate_now(policy, logger, progress=progress)
+        evaluator.evaluate_now(inference_policy, logger, progress=progress)
 
     # Flush the final partial interval only when this function owns the logger.
     return logger.finish() if owns_logger else logger.history

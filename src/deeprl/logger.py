@@ -6,7 +6,7 @@ import json
 import math
 import time
 from collections import defaultdict, deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
@@ -82,10 +82,14 @@ class Logger:
         )
 
         self._episode_returns = torch.zeros(
-            num_envs, dtype=torch.float32, device=self.device
+            num_envs,
+            dtype=torch.float32,
+            device=self.device,
         )
         self._episode_lengths = torch.zeros(
-            num_envs, dtype=torch.int64, device=self.device
+            num_envs,
+            dtype=torch.int64,
+            device=self.device,
         )
         self._recent_returns: deque[float] = deque(maxlen=episode_window)
         self._recent_lengths: deque[float] = deque(maxlen=episode_window)
@@ -117,7 +121,11 @@ class Logger:
         if show_progress and total_timesteps is not None:
             from tqdm import tqdm
 
-            self._progress = tqdm(total=total_timesteps, unit="step", dynamic_ncols=True)
+            self._progress = tqdm(
+                total=total_timesteps,
+                unit="step",
+                dynamic_ncols=True,
+            )
     
     @property
     def global_step(self) -> int:
@@ -130,6 +138,7 @@ class Logger:
         return self._training_progress.gradient_step
 
     def _set_training_progress(self, progress: TrainingProgress) -> None:
+        """Mirror trainer counters without advancing the training schedule."""
         self._training_progress = progress
         if self._progress is not None:
             position = min(progress.global_step, self._progress.total)
@@ -177,7 +186,7 @@ class Logger:
         values: torch.Tensor | None = None,
         targets: torch.Tensor | None = None,
     ) -> None:
-        """Accumulate one vector-environment step without dumping metrics."""
+        """Accumulate rewards/dones shaped (N,) without dumping metrics."""
         if rewards.shape != (self.num_envs,):
             raise ValueError(
                 f"rewards must have shape ({self.num_envs},), got {tuple(rewards.shape)}"
@@ -192,7 +201,8 @@ class Logger:
             raise ValueError("values and targets must have the same shape")
 
         rewards = rewards.detach().to(
-            device=self.device, dtype=self._episode_returns.dtype
+            device=self.device,
+            dtype=self._episode_returns.dtype,
         )
         dones = dones.detach().to(device=self.device, dtype=torch.bool)
 
@@ -256,7 +266,10 @@ class Logger:
     # ------------------------------------------------------------------ update
 
     def log_update(
-        self, stats: TrainingStats, *, progress: TrainingProgress
+        self,
+        stats: TrainingStats,
+        *,
+        progress: TrainingProgress,
     ) -> None:
         """Accumulate one complete algorithm-update summary."""
         if stats.gradient_steps < 0:
@@ -281,6 +294,7 @@ class Logger:
             self._next_log_step += self.log_every
 
     def _dump(self) -> None:
+        """Reduce pending update metrics and report episode windows and throughput."""
         now = time.perf_counter()
         metrics = {
             name: total / self._metric_weights[name]
@@ -331,25 +345,47 @@ class Logger:
         *,
         progress: TrainingProgress,
         deterministic: bool,
+        episode_seeds: Sequence[int] | None = None,
     ) -> None:
-        """Record raw episodes and their within-run evaluation summary."""
-        returns = episode_returns.detach().flatten().to(dtype=torch.float32, device="cpu")
-        lengths = episode_lengths.detach().flatten().to(dtype=torch.float32, device="cpu")
+        """Record one return/length per episode and their within-run summary."""
+        returns = episode_returns.detach().flatten().to(
+            dtype=torch.float32,
+            device="cpu",
+        )
+        lengths = episode_lengths.detach().flatten().to(
+            dtype=torch.float32,
+            device="cpu",
+        )
         if returns.shape != lengths.shape:
             raise ValueError("episode_returns and episode_lengths must have the same shape")
         if returns.numel() == 0:
             raise ValueError("evaluation must contain at least one episode")
+        if episode_seeds is not None:
+            episode_seeds = tuple(episode_seeds)
+            if len(episode_seeds) != returns.numel() or any(
+                type(seed) is not int for seed in episode_seeds
+            ):
+                raise ValueError("episode_seeds must contain one integer per evaluation episode")
 
         self._set_training_progress(progress)
         mode = "deterministic" if deterministic else "stochastic"
-        for episode_return, episode_length in zip(
-            returns.tolist(), lengths.tolist(), strict=True
-        ):
+        for index, (episode_return, episode_length) in enumerate(zip(
+            returns.tolist(),
+            lengths.tolist(),
+            strict=True,
+        )):
             self._emit(
                 "eval_episode",
                 {
                     f"eval/{mode}_episodic_return": episode_return,
                     f"eval/{mode}_episodic_length": episode_length,
+                },
+                metadata={
+                    "evaluation": {
+                        "mode": mode,
+                        "deterministic": deterministic,
+                        "seed": None if episode_seeds is None else episode_seeds[index],
+                    },
                 },
             )
 
@@ -359,6 +395,13 @@ class Logger:
                 f"eval/{mode}_return_mean": returns.mean().item(),
                 f"eval/{mode}_return_std": returns.std(unbiased=False).item(),
                 f"eval/{mode}_length_mean": lengths.mean().item(),
+            },
+            metadata={
+                "evaluation": {
+                    "mode": mode,
+                    "deterministic": deterministic,
+                    "episode_seeds": None if episode_seeds is None else list(episode_seeds),
+                },
             },
         )
 
@@ -375,7 +418,9 @@ class Logger:
         *,
         step: int | None = None,
         elapsed_seconds: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
+        """Write scalar curves to all outputs; descriptive metadata stays in JSONL."""
         at = self.global_step if step is None else int(step)
         scalars = {name: _scalar(value) for name, value in metrics.items()}
 
@@ -392,6 +437,8 @@ class Logger:
             }
             if elapsed_seconds is not None:
                 row["elapsed_seconds"] = elapsed_seconds
+            if metadata is not None:
+                row.update(metadata)
             row.update(
                 {
                     name: value if math.isfinite(value) else None

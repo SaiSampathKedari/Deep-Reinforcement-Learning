@@ -1,3 +1,5 @@
+"""Distribution heads for policies backed by caller-supplied networks."""
+
 from __future__ import annotations
 
 import math
@@ -6,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical, Independent, Normal
 
-from deeprl.buffers import TensorData
+from deeprl.data_spec import TensorData
 
 
 class CategoricalPolicy(nn.Module):
@@ -17,6 +19,7 @@ class CategoricalPolicy(nn.Module):
         self.logits_network = logits_network
 
     def forward(self, observations: TensorData) -> Categorical:
+        """Return B categorical distributions: samples and log-probs are (B,)."""
         logits = self.logits_network(observations)  # (B, num_actions)
         
         batch_size = observations.shape[0]
@@ -59,6 +62,7 @@ class DiagonalGaussianPolicy(nn.Module):
         )
 
     def forward(self, observations: TensorData) -> Independent:
+        """Return samples (B, action_dim) with joint log-probs/entropy (B,)."""
         mean = self.mean_network(observations)  # (B, action_dim)
         expected_shape = (observations.shape[0], self.log_std.numel())
 
@@ -74,5 +78,5 @@ class DiagonalGaussianPolicy(nn.Module):
             log_std = log_std.clamp(*self.log_std_bounds)
         std = log_std.exp().expand_as(mean)  # (B, action_dim)
 
-        # Sum log-probabilities and entropy over the action components.
+        # Treat action components as one event, leaving only the batch axis.
         return Independent(Normal(mean, std), 1)

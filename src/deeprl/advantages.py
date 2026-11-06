@@ -19,6 +19,7 @@ def generalized_advantage_estimate(
     gamma        : float,
     gae_lambda   : float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return GAE advantages and value targets, both shaped (T, N)."""
 
     T = rewards.shape[0]
     dtype = values.dtype
@@ -27,8 +28,8 @@ def generalized_advantage_estimate(
     # Do not bootstrap after genuine MDP terminations.
     bootstrap_mask = (~terminations).to(dtype=dtype)
 
-    # Stop the trace at any episode boundary: s_{t+1} starts a new episode,
-    # so A_{t+1} does not belong in A_t.
+    # Stop the trace at any episode boundary; the next stored transition
+    # belongs to a new episode, so its advantage must not propagate backwards.
     trace_mask = (~(terminations | truncations)).to(dtype=dtype)
 
     # One TD error per environment per step. Shape: (T, N).
