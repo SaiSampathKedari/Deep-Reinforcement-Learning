@@ -39,15 +39,22 @@ PPO_CONFIG = PPOConfig(
     normalize_advantage=True,
     normalize_advantage_per_minibatch=True,
     normalize_value_targets=True,
-    normalize_observations_during_collection=True,
     log_ratio_clip=20.0,
     ent_coef=0.0,
     target_kl=None,
     max_grad_norm=0.5,
     actor_optimizer_class=torch.optim.AdamW,
-    actor_optimizer_kwargs={"eps": 1e-8, "weight_decay": 0.01, "betas": (0.9, 0.999)},
+    actor_optimizer_kwargs={
+        "eps": 1e-8,
+        "weight_decay": 0.01,
+        "betas": (0.9, 0.999),
+    },
     critic_optimizer_class=torch.optim.AdamW,
-    critic_optimizer_kwargs={"eps": 1e-8, "weight_decay": 0.01, "betas": (0.9, 0.999)},
+    critic_optimizer_kwargs={
+        "eps": 1e-8,
+        "weight_decay": 0.01,
+        "betas": (0.9, 0.999),
+    },
     log_every=32_768,
 )
 

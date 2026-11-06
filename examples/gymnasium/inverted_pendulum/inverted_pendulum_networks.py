@@ -3,9 +3,20 @@
 import torch
 from torch import nn
 
+from deeprl.policies import DiagonalGaussianPolicy
+
+
+def build_policy(config: dict) -> DiagonalGaussianPolicy:
+    """Reconstruct the actor from an exported policy's constructor arguments."""
+    return DiagonalGaussianPolicy(
+        PolicyNetwork(config["obs_dim"], config["action_dim"]),
+        action_dim=config["action_dim"],
+        log_std_init=config["log_std_init"],
+    )
+
 
 class PolicyNetwork(nn.Module):
-    """Map observations to Gaussian action means."""
+    """Map (B, obs_dim) observations to (B, action_dim) Gaussian means."""
 
     def __init__(
         self,
@@ -29,13 +40,13 @@ class PolicyNetwork(nn.Module):
                 nn.init.zeros_(layer.bias)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        # Match the network dtype; MuJoCo observations arrive as float64.
+        # Match the model dtype when called outside the float32 environment adapter.
         observations = observations.to(dtype=next(self.parameters()).dtype)
         return self.network(observations)  # (B, action_dim)
 
 
 class ValueNetwork(nn.Module):
-    """Map observations to scalar state-value predictions."""
+    """Map (B, obs_dim) observations to (B, 1) state values."""
 
     def __init__(self, obs_dim: int = 4) -> None:
         super().__init__()
@@ -55,6 +66,6 @@ class ValueNetwork(nn.Module):
                 nn.init.zeros_(layer.bias)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        # Match the network dtype; MuJoCo observations arrive as float64.
+        # Match the model dtype when called outside the float32 environment adapter.
         observations = observations.to(dtype=next(self.parameters()).dtype)
         return self.network(observations)  # (B, 1)

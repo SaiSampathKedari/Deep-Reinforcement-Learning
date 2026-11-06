@@ -3,9 +3,25 @@
 import torch
 from torch import nn
 
+from deeprl.policies import DiagonalGaussianPolicy
+
+
+def build_policy(config: dict) -> DiagonalGaussianPolicy:
+    """Reconstruct the actor from an exported policy's constructor arguments."""
+    return DiagonalGaussianPolicy(
+        PolicyNetwork(
+            config["obs_dim"],
+            config["action_dim"],
+            tuple(config["hidden_sizes"]),
+        ),
+        action_dim=config["action_dim"],
+        log_std_init=config["log_std_init"],
+        log_std_bounds=tuple(config["log_std_bounds"]),
+    )
+
 
 class PolicyNetwork(nn.Module):
-    """Map observations to Gaussian action means."""
+    """Map (B, obs_dim) observations to (B, action_dim) Gaussian means."""
 
     def __init__(
         self,
@@ -24,20 +40,20 @@ class PolicyNetwork(nn.Module):
             nn.Linear(hidden_2, action_dim),
         )
 
-        # Match the inspected reference implementation, including its output head.
+        # Apply Tanh gain to all linear layers, including the action-mean head.
         for layer in self.network:
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=nn.init.calculate_gain("tanh"))
                 nn.init.zeros_(layer.bias)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        # Match the network dtype; MuJoCo observations arrive as float64.
+        # Match the model dtype when called outside the float32 environment adapter.
         observations = observations.to(dtype=next(self.parameters()).dtype)
         return self.network(observations)  # (B, action_dim)
 
 
 class ValueNetwork(nn.Module):
-    """Map observations to scalar state-value predictions."""
+    """Map (B, obs_dim) observations to (B, 1) state values."""
 
     def __init__(
         self,
@@ -55,13 +71,13 @@ class ValueNetwork(nn.Module):
             nn.Linear(hidden_2, 1),
         )
 
-        # The reference applies Tanh gain to every linear layer, including V(s).
+        # Apply Tanh gain to all linear layers, including the state-value head.
         for layer in self.network:
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=nn.init.calculate_gain("tanh"))
                 nn.init.zeros_(layer.bias)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        # Match the network dtype; MuJoCo observations arrive as float64.
+        # Match the model dtype when called outside the float32 environment adapter.
         observations = observations.to(dtype=next(self.parameters()).dtype)
         return self.network(observations)  # (B, 1)

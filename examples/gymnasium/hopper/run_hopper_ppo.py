@@ -4,22 +4,31 @@ import argparse
 import json
 from contextlib import ExitStack
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import gymnasium as gym
+import numpy as np
 import torch
 from gymnasium.vector import AutoresetMode
 from gymnasium.wrappers.vector import NumpyToTorch
-from torch import nn
 
 from deeprl.training.train_on_policy import train_on_policy
 from deeprl.algorithms.ppo import PPOLearner
 from deeprl.checkpoint import load_checkpoint
+from deeprl.data_spec import DataSpec, FeatureSpec
 from deeprl.evaluate import Evaluator
-from deeprl.lifecycle import config_to_jsonable, seed_torch, validate_run_config
+from deeprl.lifecycle import (
+    config_to_jsonable,
+    get_provenance,
+    seed_torch,
+    validate_run_config,
+)
 from deeprl.logger import Logger
-from deeprl.normalization import RewardScaler, RunningNormalizer
+from deeprl.normalization import RewardScaler
 from deeprl.policies import DiagonalGaussianPolicy
+from deeprl.policy_io import describe_policy, save_policy
+from deeprl.processors import ActionProcessor, ObservationProcessor
 from deeprl.value import ValueFunction
 from examples.gymnasium.hopper import (
     ppo_hopper_config as settings,
@@ -27,15 +36,19 @@ from examples.gymnasium.hopper import (
 from examples.gymnasium.hopper.hopper_networks import (
     PolicyNetwork,
     ValueNetwork,
+    build_policy,
 )
 
 
 def main() -> None:
-    # Config supplies defaults; command-line arguments override selected values.
+    """Train with resolved settings and export the final inference policy."""
+    # 0. Resolve config defaults and command-line overrides.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=settings.PPO_CONFIG.seed)
     parser.add_argument(
-        "--device", type=torch.device, default=settings.PPO_CONFIG.device
+        "--device",
+        type=torch.device,
+        default=settings.PPO_CONFIG.device,
     )
     parser.add_argument(
         "--total-timesteps",
@@ -43,7 +56,9 @@ def main() -> None:
         default=settings.PPO_CONFIG.total_timesteps,
     )
     parser.add_argument(
-        "--vectorization-mode", choices=("sync", "async"), default="sync",
+        "--vectorization-mode",
+        choices=("sync", "async"),
+        default="sync",
         help="Run CPU environments sequentially or in separate processes.",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -57,7 +72,7 @@ def main() -> None:
         total_timesteps=args.total_timesteps,
     )
 
-    # Preserve settings needed to reconstruct and identify this experiment.
+    # 1. Validate resume settings and record the new run.
     run_config = {
         "env_id": settings.ENV_ID,
         "vectorization_mode": args.vectorization_mode,
@@ -112,9 +127,9 @@ def main() -> None:
 
     seed_torch(cfg.seed)  # Seed before initializing network weights.
 
-    # Close environments and flush logging even if training raises an exception.
+    # 2. Create environments and logging resources with guaranteed cleanup.
     with ExitStack() as stack:
-        # Clip executed actions only; the buffer retains raw Gaussian samples.
+        # Environments receive native commands; the policy converts its samples.
         vector_kwargs: dict[str, object] = {"autoreset_mode": AutoresetMode.DISABLED}
         if args.vectorization_mode == "async":
             # Spawn workers without inheriting the parent's CUDA runtime.
@@ -124,13 +139,16 @@ def main() -> None:
             num_envs=settings.NUM_ENVS,
             vectorization_mode=args.vectorization_mode,
             vector_kwargs=vector_kwargs,
-            wrappers=(gym.wrappers.ClipAction,),
+            wrappers=(partial(gym.wrappers.DtypeObservation, dtype=np.float32),),
         )
         stack.callback(envs.close)
         envs = NumpyToTorch(envs, device=cfg.device)
 
         eval_env = stack.enter_context(
-            gym.wrappers.ClipAction(gym.make(settings.ENV_ID))
+            gym.wrappers.DtypeObservation(
+                gym.make(settings.ENV_ID),
+                dtype=np.float32,
+            )
         )
         try:
             from torch.utils.tensorboard import SummaryWriter
@@ -141,20 +159,37 @@ def main() -> None:
                 SummaryWriter(log_dir=str(args.output_dir / "events"))
             )
 
+        # 3. Construct the models, processors, and learner.
+        # Vector batches: (N, obs_dim) observations and (N, action_dim) continuous actions.
         obs_dim = envs.single_observation_space.shape[0]
         action_dim = envs.single_action_space.shape[0]
-
-        mean_network: nn.Module = PolicyNetwork(
-            obs_dim, action_dim, settings.POLICY_HIDDEN_SIZES
+        action_processor = ActionProcessor(
+            source_bounds=(envs.single_action_space.low, envs.single_action_space.high),
+            clip=True,
         )
-        value_network: nn.Module = ValueNetwork(obs_dim, settings.VALUE_HIDDEN_SIZES)
 
-        # Both networks use the same moments; only the shared trainer updates them.
-        obs_normalizer = None
-        if settings.OBS_NORMALIZATION is not None:
-            obs_normalizer = RunningNormalizer((obs_dim,), **settings.OBS_NORMALIZATION)
-            mean_network = nn.Sequential(obs_normalizer, mean_network)
-            value_network = nn.Sequential(obs_normalizer, value_network)
+        mean_network = PolicyNetwork(
+            obs_dim,
+            action_dim,
+            settings.POLICY_HIDDEN_SIZES,
+        )
+        value_network = ValueNetwork(obs_dim, settings.VALUE_HIDDEN_SIZES)
+
+        # Both models share the state contract declared by the environment adapter.
+        obs_processor = ObservationProcessor(
+            DataSpec(
+                observations=(
+                    FeatureSpec(
+                        "state",
+                        tuple(envs.single_observation_space.shape),
+                        envs.single_observation_space.dtype.name,
+                    ),
+                ),
+                actions=(),
+            ),
+            normalize=() if settings.OBS_NORMALIZATION is None else ("state",),
+            **(settings.OBS_NORMALIZATION or {}),
+        )
 
         policy = DiagonalGaussianPolicy(
             mean_network,
@@ -162,15 +197,49 @@ def main() -> None:
             log_std_init=settings.LOG_STD_INIT,
         )
         value_fn = ValueFunction(value_network)
-        learner = PPOLearner(policy, value_fn, cfg)
 
         # Reward scaling affects training targets, not environment rewards.
         reward_scaler = None
         if settings.REWARD_SCALING is not None:
             reward_scaler = RewardScaler(
-                settings.NUM_ENVS, gamma=cfg.gamma, **settings.REWARD_SCALING
+                settings.NUM_ENVS,
+                gamma=cfg.gamma,
+                **settings.REWARD_SCALING,
             )
+        learner = PPOLearner(
+            policy,
+            value_fn,
+            cfg,
+            obs_processor=obs_processor,
+            action_processor=action_processor,
+            reward_scaler=reward_scaler,
+        )
 
+        # 4. Describe the actor's inference interface independently of training state.
+        learner.inference_policy.deterministic = True
+        policy_spec = DataSpec(
+            observations=obs_processor.spec.observations,
+            actions=(
+                FeatureSpec("action", tuple(envs.single_action_space.shape), "float32"),
+            ),
+        )
+        model_id = f"{build_policy.__module__}.{build_policy.__name__}"
+        model_config = {
+            "obs_dim": obs_dim,
+            "action_dim": action_dim,
+            "hidden_sizes": list(settings.POLICY_HIDDEN_SIZES),
+            "log_std_init": settings.LOG_STD_INIT,
+        }
+        provenance = {**get_provenance(), "env_id": settings.ENV_ID}
+        policy_manifest = describe_policy(
+            learner.inference_policy,
+            spec=policy_spec,
+            model_id=model_id,
+            model_config=model_config,
+            provenance=provenance,
+        )
+
+        # 5. Configure evaluation and training metrics.
         evaluator = Evaluator(
             eval_env,
             eval_every=settings.EVAL_EVERY,
@@ -189,6 +258,7 @@ def main() -> None:
         )
         stack.callback(logger.finish)  # Flush metrics before closing the writer.
 
+        # 6. Collect rollouts, update the learner, and save training checkpoints.
         train_on_policy(
             envs=envs,
             learner=learner,
@@ -198,8 +268,21 @@ def main() -> None:
             checkpoint_interval=settings.CHECKPOINT_INTERVAL,
             run_config=run_config,
             resume_from=args.resume_from,
-            obs_normalizer=obs_normalizer,
-            reward_scaler=reward_scaler,
+            policy_manifest=policy_manifest,
+        )
+
+        # 7. Export the completed actor and frozen preprocessing for inference.
+        rollout_size = cfg.rollout_steps * settings.NUM_ENVS
+        save_policy(
+            args.output_dir / "policy",
+            learner.inference_policy,
+            spec=policy_spec,
+            model_id=model_id,
+            model_config=model_config,
+            provenance={
+                **provenance,
+                "training_step": cfg.total_timesteps // rollout_size * rollout_size,
+            },
         )
 
     print(f"Run saved to {args.output_dir}")
