@@ -3,8 +3,10 @@
 On-policy algorithms (PPO, A2C, NPG, TRPO) learn from data collected by the
 current policy, then throw that data away. This module holds what they share:
 
-* ``evaluate_next_values``: value estimates of next observations, used to
-  "bootstrap" returns.
+* ``evaluate_next_values``: the critic's estimate of each next state's value.
+  When a rollout is cut off or an episode hits a time limit, the rewards
+  that would have followed are unknown; the critic's estimate stands in for
+  them. This is called "bootstrapping".
 * ``OnPolicyConfig``: settings every on-policy algorithm needs (run length,
   rollout length, discount factor, GAE lambda).
 * ``OnPolicyLearner``: the base class each algorithm extends. It owns the
@@ -58,7 +60,8 @@ def evaluate_next_values(
       never the value of the next episode's first observation.
 
     Args:
-        value_fn: Maps raw observations to values shaped ``(K,)``.
+        value_fn: Maps K raw observations to K values, shaped ``(K,)``. Here
+            K is the number of steps that did not terminate.
         next_observations: Next observations, each feature shaped
             ``(T, N, *feature_shape)``.
         terminations: True where an episode terminated, shaped ``(T, N)``.
@@ -92,7 +95,9 @@ class OnPolicyConfig:
 
     Attributes:
         total_timesteps: Total environment steps to train for, counted across
-            all environments.
+            all environments. Only whole rollouts are collected, so the run
+            uses ``total_timesteps // (T * N)`` rollouts. On resume this stays
+            the budget for the whole run, not an additional number of steps.
         seed: Random seed. The trainer uses it for action sampling,
             minibatch shuffling and the environments' first reset. The
             networks are built before the trainer runs, so their initial
@@ -100,8 +105,12 @@ class OnPolicyConfig:
             them (the examples call ``seed_torch(cfg.seed)`` first).
         device: Device for the networks and training, for example ``cpu`` or
             ``cuda``.
-        log_every: Write a log entry every this many environment steps.
-            0 turns periodic logging off.
+        log_every: For the logger the trainer creates: a periodic training
+            report becomes due every this many environment steps. 0 turns
+            periodic reports off; finished episodes and the final report
+            are still logged. A logger you pass in uses its own settings,
+            and its final report is written when you call its
+            ``finish()``.
         rollout_steps: T, the number of steps collected from each environment
             before every update. One rollout holds ``T * N`` transitions.
         gamma: Discount factor: how much future rewards count, between 0 and 1.
@@ -113,16 +122,16 @@ class OnPolicyConfig:
             always a complete Monte Carlo return.
     """
 
-    # Run control
-    total_timesteps     :   int          = 500_000  # Total transitions across all environments.
-    seed                :   int          = 0
-    device              :   torch.device = torch.device("cpu")
-    log_every           :   int          = 1000
+    # Run control.
+    total_timesteps : int          = 500_000  # Total transitions across all environments.
+    seed            : int          = 0
+    device          : torch.device = torch.device("cpu")
+    log_every       : int          = 1_000    # Transition reporting interval; 0 disables.
 
-    # Rollout and advantage estimation
-    rollout_steps       :   int          = 128      # T: transitions collected per environment.
-    gamma               :   float        = 0.99     # Reward discount factor.
-    gae_lambda          :   float        = 0.95     # Lambda in generalized advantage estimation.
+    # Rollout and advantage estimation.
+    rollout_steps   : int          = 128      # T: transitions collected per environment.
+    gamma           : float        = 0.99     # Reward discount factor.
+    gae_lambda      : float        = 0.95     # Lambda in generalized advantage estimation.
 
     def __post_init__(self) -> None:
         """Check the settings when the config is created.
@@ -196,18 +205,33 @@ class OnPolicyLearner(ABC):
         reward_scaler: Training-only reward scaling.
 
     Attributes:
+        cfg: The algorithm's config.
+        policy: The actor network, on ``cfg.device``.
+        value_fn: The critic network, on ``cfg.device``.
+        obs_processor: The shared observation processor, or ``None``.
+        reward_scaler: The reward scaler, or ``None``.
+        inference_policy: The complete policy: ``obs_processor``, ``policy``
+            and the action processor. The action processor is only reachable
+            here, as ``inference_policy.action_processor``.
         mutable_on_resume: Config fields allowed to change when training
             resumes from a checkpoint. Algorithms extend this set, for example
             with learning rates.
     """
 
-    mutable_on_resume = frozenset({"total_timesteps", "device", "log_every"})
+    mutable_on_resume = frozenset({
+        "total_timesteps",
+        "device",
+        "log_every",
+    })
 
+    # ------------------------------------------------------------------
+    # 0. Learner setup
+    # ------------------------------------------------------------------
     def __init__(
         self,
-        policy      :   nn.Module,
-        value_fn    :   nn.Module,
-        cfg         :   OnPolicyConfig,
+        policy: nn.Module,
+        value_fn: nn.Module,
+        cfg: OnPolicyConfig,
         *,
         obs_processor: ObservationProcessor | None = None,
         action_processor: ActionProcessor | None = None,
@@ -270,80 +294,39 @@ class OnPolicyLearner(ABC):
             action_processor=action_processor,
         )
 
-    def evaluate_values(self, observations: TensorData) -> torch.Tensor:
-        """Return the critic's value estimates for raw observations.
+    # ------------------------------------------------------------------
+    # 1. Learner checkpoint state
+    # ------------------------------------------------------------------
+    @abstractmethod
+    def state_dict(self) -> dict[str, Any]:
+        """Return the learner's own state.
 
-        The observation processor gives the critic its features, including
-        privileged ones. Gradients flow, so ``update`` can train the critic
-        with this method too.
+        That includes the networks, optimizers and auxiliary state such as the
+        reward scaler, each under its own key. It is not everything needed to
+        resume: the trainer saves the rest of the checkpoint (progress,
+        random-number state, observation statistics, configs).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore a state made by ``state_dict``.
+
+        Implementations check the keys first, then restore into the existing
+        networks and optimizers. Loading is not all-or-nothing: an error while
+        loading one part's tensors can happen after earlier parts were
+        already restored. After such an error, build a new learner.
 
         Args:
-            observations: Raw observations, batched.
-
-        Returns:
-            One value per observation, shaped ``(B,)``.
+            state: The saved learner state, not the whole training checkpoint.
         """
-        if self.obs_processor is not None:
-            observations = self.obs_processor(observations, group="critic")
-        return self.value_fn(observations)
-
-    @torch.no_grad()
-    def prepare_targets(
-        self,
-        buffer: RolloutBuffer,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute advantages and value targets for one complete rollout.
-
-        Runs without gradients: the results are fixed numbers that ``update``
-        trains towards, not things to differentiate through. The observation
-        statistics are the same ones used during collection. Rewards are
-        scaled in a copy, so the buffer's rewards stay raw for logging.
-
-        Args:
-            buffer: A full rollout buffer.
-
-        Returns:
-            ``(advantages, value_targets)``, both shaped ``(T, N)``.
-
-        Raises:
-            RuntimeError: If the rollout is not complete.
-        """
-        # 0. Targets need every step of the rollout.
-        if not buffer.full or buffer.next_observations is None:
-            raise RuntimeError("cannot prepare targets from an incomplete rollout")
-
-        # 1. Value of each next state; terminated steps get 0 (see
-        #    evaluate_next_values).
-        next_values = evaluate_next_values(
-            self.evaluate_values,
-            buffer.next_observations,
-            buffer.terminations,
-        )
-
-        # 2. Scale the rewards for training, if enabled. This returns a copy;
-        #    the buffer keeps the raw rewards.
-        rewards = buffer.rewards
-        if self.reward_scaler is not None:
-            rewards = self.reward_scaler(rewards, buffer.dones)
-
-        # 3. Generalized advantage estimation (advantages.py): how much better
-        #    each action was than expected (advantages), and what the critic
-        #    should predict (value targets).
-        return generalized_advantage_estimate(
-            rewards,
-            buffer.values,
-            next_values=next_values,
-            terminations=buffer.terminations,
-            truncations=buffer.truncations,
-            gamma=self.cfg.gamma,
-            gae_lambda=self.cfg.gae_lambda,
-        )
+        raise NotImplementedError
 
     def validate_reward_scaler_state(self, state: Mapping[str, Any]) -> None:
         """Check that a saved learner state matches this learner's reward scaling.
 
-        Called before anything is restored, so a mismatch never leaves the
-        learner half-loaded.
+        Called before restoring learner components, so a reward-scaling
+        configuration mismatch is rejected before their state is changed.
 
         Args:
             state: A learner state from a checkpoint.
@@ -374,26 +357,9 @@ class OnPolicyLearner(ABC):
         if not isinstance(saved["state_dict"], Mapping):
             raise ValueError("checkpoint reward_scaler state_dict must be a mapping")
 
-    @abstractmethod
-    def state_dict(self) -> dict[str, Any]:
-        """Return the learner's own state.
-
-        That includes the networks, optimizers and auxiliary state such as the
-        reward scaler, each under its own key. It is not everything needed to
-        resume: the trainer saves the rest of the checkpoint (progress,
-        random-number state, observation statistics, configs).
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def load_state_dict(self, state: dict[str, Any]) -> None:
-        """Restore a state made by ``state_dict``.
-
-        Implementations check the keys first, then restore into the existing
-        networks and optimizers.
-        """
-        raise NotImplementedError
-
+    # ------------------------------------------------------------------
+    # 2. Resume configuration
+    # ------------------------------------------------------------------
     def validate_resume_config(
         self,
         saved_config: dict[str, Any],
@@ -430,14 +396,109 @@ class OnPolicyLearner(ABC):
         """
         raise NotImplementedError
 
+    # ------------------------------------------------------------------
+    # 3. Critic values and training targets
+    # ------------------------------------------------------------------
+    def evaluate_values(self, observations: TensorData) -> torch.Tensor:
+        """Return the critic's value estimates for raw observations.
+
+        The observation processor gives the critic its features, including
+        privileged ones. It is used in three places:
+
+        * during collection, to store the value of every step;
+        * in ``prepare_targets``, for the value of every next state;
+        * in ``update``, for the critic's loss. Gradients flow, so the critic
+          can be trained through this method.
+
+        Args:
+            observations: Raw observations, batched.
+
+        Returns:
+            One value per observation, shaped ``(B,)``.
+        """
+        if self.obs_processor is not None:
+            observations = self.obs_processor(observations, group="critic")
+        return self.value_fn(observations)
+
+    @torch.no_grad()
+    def prepare_targets(
+        self,
+        buffer: RolloutBuffer,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute advantages and value targets for one complete rollout.
+
+        Runs without gradients: the results are fixed numbers that ``update``
+        trains towards, not things to differentiate through. The observation
+        statistics are the same ones used during collection. Rewards are
+        scaled in a copy, so the buffer's rewards stay raw for logging.
+
+        Call it exactly once per rollout. With a reward scaler, it also
+        advances the scaler's running returns and statistics, so a second
+        call on the same rollout would count those rewards twice.
+
+        Args:
+            buffer: A full rollout buffer.
+
+        Returns:
+            ``(advantages, value_targets)``, both shaped ``(T, N)``.
+
+        Raises:
+            RuntimeError: If the rollout is not complete.
+        """
+        # 0. Targets need every step of the rollout.
+        if not buffer.full or buffer.next_observations is None:
+            raise RuntimeError("cannot prepare targets from an incomplete rollout")
+
+        # 1. Value of each next state; terminated steps get 0 (see
+        #    evaluate_next_values).
+        next_values = evaluate_next_values(
+            self.evaluate_values,
+            buffer.next_observations,
+            buffer.terminations,
+        )
+
+        # 2. Scale the rewards for training, if enabled. The scaler first adds
+        #    this rollout to its running statistics, then returns a scaled
+        #    copy; the buffer keeps the raw rewards.
+        rewards = buffer.rewards
+        if self.reward_scaler is not None:
+            rewards = self.reward_scaler(rewards, buffer.dones)
+
+        # 3. Generalized advantage estimation (advantages.py): how much better
+        #    each action was than expected (advantages), and what the critic
+        #    should predict (value targets).
+        return generalized_advantage_estimate(
+            rewards,
+            buffer.values,
+            next_values=next_values,
+            terminations=buffer.terminations,
+            truncations=buffer.truncations,
+            gamma=self.cfg.gamma,
+            gae_lambda=self.cfg.gae_lambda,
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Algorithm-specific parameter updates
+    # ------------------------------------------------------------------
     @abstractmethod
     def update(
         self,
-        buffer          :   RolloutBuffer,
-        advantages      :   torch.Tensor,
-        value_targets   :   torch.Tensor,
+        buffer: RolloutBuffer,
+        advantages: torch.Tensor,
+        value_targets: torch.Tensor,
     ) -> TrainingStats:
         """Train the actor and critic on one complete rollout.
+
+        Each algorithm uses the rollout its own way: PPO runs several epochs
+        of minibatches, A2C takes one gradient step on the whole rollout,
+        NPG and TRPO attempt one natural-gradient policy step per batch
+        they draw from it; with the default batching (the whole rollout as
+        one batch) that is one attempt per rollout, and TRPO rejects a
+        step that fails its checks. The
+        trainer leaves the networks in evaluation mode after collection,
+        so implementations set the modes they need themselves: PPO and A2C
+        switch both networks to training mode; NPG and TRPO keep the actor
+        in evaluation mode (gradients still flow in evaluation mode).
 
         Args:
             buffer: The full rollout buffer.
