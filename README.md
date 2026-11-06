@@ -56,15 +56,19 @@ uv run python -m examples.gymnasium.cartpole.run_cartpole_ppo \
 
 This trains PPO on **CartPole-v1** on CPU with eight environments and 102,400
 transitions. Choose a new output directory for each run. The run saves its
-configuration, JSONL metrics, TensorBoard events, and checkpoints.
+configuration, JSONL metrics, TensorBoard events, training checkpoints, and a
+final inference policy directory.
 
 Evaluate the final saved policy:
 
 ```bash
 uv run python -m examples.gymnasium.cartpole.evaluate_cartpole \
-  outputs/gymnasium/cartpole/ppo/seed_0/run_01/checkpoints/last.pt \
-  --episodes 10 --seed 20000 --mode deterministic
+  outputs/gymnasium/cartpole/ppo/seed_0/run_01/policy \
+  --episodes 10 --seed 20000
 ```
+
+Evaluation uses the inference mode saved with the policy. Pass
+`--mode deterministic` or `--mode stochastic` to override it explicitly.
 
 View the training and evaluation curves:
 
@@ -99,12 +103,13 @@ benchmark work, separate from having a runnable example.
 
 ## Library Structure
 
-- **Learning rules:** [algorithms/](src/deeprl/algorithms/) contains configs, losses, and parameter updates. Learners use native PyTorch optimizers; NPG/TRPO perform their actor updates directly.
-- **Training lifecycle:** [train_on_policy.py](src/deeprl/training/train_on_policy.py) coordinates collection, GAE, updates, evaluation, and checkpoint timing.
-- **Data and targets:** [buffers.py](src/deeprl/buffers.py), [rollouts.py](src/deeprl/rollouts.py), and [advantages.py](src/deeprl/advantages.py) separate storage, interaction, and advantage estimation.
-- **Networks and preprocessing:** [policies.py](src/deeprl/policies.py) and [value.py](src/deeprl/value.py) wrap caller-supplied networks; [normalization.py](src/deeprl/normalization.py) provides explicit running statistics. Architectures stay with the task examples.
+- **Learning rules:** [algorithms/](src/deeprl/algorithms/) contains configs, target preparation, losses, and parameter updates. Learners use native PyTorch optimizers; NPG/TRPO perform their actor updates directly.
+- **Training lifecycle:** [train_on_policy.py](src/deeprl/training/train_on_policy.py) coordinates collection, learner target preparation and updates, evaluation, and checkpoint timing.
+- **Data and targets:** [buffers.py](src/deeprl/buffers.py), [collectors.py](src/deeprl/collectors.py), and [advantages.py](src/deeprl/advantages.py) separate storage, interaction, and advantage estimation.
+- **Networks and preprocessing:** [policies.py](src/deeprl/policies.py) and [value.py](src/deeprl/value.py) wrap caller-supplied networks; [processors.py](src/deeprl/processors.py) handles shared input normalization and action conversion, composed with the model by [inference.py](src/deeprl/inference.py). Buffers retain raw observations; the trainer explicitly schedules statistics updates. Architectures stay with the task examples.
 - **Evaluation and logging:** [evaluate.py](src/deeprl/evaluate.py) and [logger.py](src/deeprl/logger.py) handle policy assessment, episode statistics, JSONL metrics, and optional TensorBoard output.
 - **State and continuation:** Concrete learners explicitly save/load their native component state. [learner_state.py](src/deeprl/learner_state.py) validates state keys and resume configuration; [checkpoint.py](src/deeprl/checkpoint.py) and [lifecycle.py](src/deeprl/lifecycle.py) handle checkpoint I/O, configuration, Torch RNG state, and provenance.
+- **Policy artifacts:** [policy_io.py](src/deeprl/policy_io.py) saves inference configuration, model weights, and actor-visible preprocessing state separately from training checkpoints. A task-local factory rebuilds the known architecture; loading needs no learner or optimizer.
 
 Rollout buffers preserve the time/environment layout `(T, N)`. Replay buffers
 use flat FIFO transition storage. Both support fixed-shape tensors and
@@ -123,22 +128,65 @@ shows the complete assembly: environments, networks, learner, logger, evaluator,
 and training call. The learner contract is in `deeprl.algorithms.on_policy`.
 These are the only on-policy import paths; there are no compatibility shims.
 
-### Checkpoints and Evaluation
+### Policies and Checkpoints
+
+Examples export `policy/manifest.json`, `policy/model.pt`, and
+`policy/processor.pt` only after training returns successfully. A running or
+interrupted job is not guaranteed to have a current `policy/` export.
+The manifest declares the input/action spec, model
+configuration, processing, and inference defaults. The artifact excludes the
+critic, optimizers, and reward/value-target statistics. Exports require a fresh
+directory and do not overwrite an existing policy.
+
+`load_policy()` receives an explicit trusted model factory and expected model
+ID; it does not import code named in JSON. Task factories live in their network
+files. Evaluators use this artifact, frozen preprocessing, and the policy's
+`act()` interface. They report raw, undiscounted episode returns, with the
+resolved action mode and episode seeds.
 
 The rollout trainer saves `last.pt` and periodic `step_<transitions>.pt` files
 at completed-update boundaries. Checkpoints include learner/optimizer state,
-trainer-managed preprocessing state, progress, supported Torch RNG state,
-configuration, and informational dependency/source provenance. Only the current
+shared observation-processing state, learner-owned reward/value statistics,
+progress, supported Torch RNG state,
+configuration, and informational dependency/source provenance. The PPO examples
+also save the policy descriptor, without duplicating its weights or moments.
+Only the current
 checkpoint contract is supported, without schema versions, migrations, or legacy
 fallbacks. There is no automatic best-checkpoint selection.
 
+To evaluate a saved snapshot before a run finishes, export it to a new policy
+directory:
+
+```python
+from deeprl.policy_io import export_policy_from_checkpoint
+
+export_policy_from_checkpoint(
+    "outputs/gymnasium/cartpole/ppo/seed_0/run_01/checkpoints/last.pt",
+    "outputs/gymnasium/cartpole/ppo/seed_0/run_01/policy_snapshot",
+)
+```
+
+Then use the existing evaluator:
+
+```bash
+uv run python -m examples.gymnasium.cartpole.evaluate_cartpole \
+  outputs/gymnasium/cartpole/ppo/seed_0/run_01/policy_snapshot \
+  --episodes 10 --seed 20000
+```
+
+Export uses the saved policy descriptor, actor weights, actor-visible observation
+statistics, action processing, and inference defaults without constructing a
+model or learner. Provenance records the snapshot's `global_step` as
+`training_step`. Checkpoints without the required descriptor or state fail;
+architecture and preprocessing are never inferred from current example defaults.
+
 Resume restores learning state but starts **fresh environment episodes**;
-it does not restore the simulator's exact trajectory. Evaluation uses frozen
-preprocessing statistics and reports raw, undiscounted episode returns.
-Deterministic and stochastic evaluations are reported separately.
+it does not restore the simulator's exact trajectory. Use `checkpoints/last.pt`
+with `--resume-from`, not as the evaluator's policy argument. Deterministic and
+stochastic evaluations remain separate measurements.
 
 The [one-step CartPole tutorial](examples/gymnasium/cartpole/run_cartpole_one_step_actor_critic.py)
-is intentionally separate: it exports inference weights, without the shared
+is intentionally separate: it exports the same `policy/` artifact, without the shared
 trainer's checkpoint/resume contract.
 
 ## From Derivations to Systems

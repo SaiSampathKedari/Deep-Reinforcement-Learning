@@ -23,7 +23,7 @@ aggregated across four sessions. That is not a held-out deterministic evaluation
 | Gaussian | State-independent log std, initially `0`, bounded to `[-5, 2]` |
 | Actions | Gaussian coordinates rescaled from `[-1, 1]` to native `[-0.4, 0.4]` |
 | Advantages | Standardized per minibatch using sample standard deviation |
-| Observation normalization | Shared online moments, epsilon `1e-8`, clip `10` |
+| Observation normalization | Shared processor moments refreshed after each learner update; epsilon `1e-8`, clip `10` after fitting |
 | Reward scaling | Per-step running discounted-return std, clip `10` |
 | Value loss | Scale both predictions and targets by running target std; clip `10` |
 | Run budget | 12,288,000 transitions = 375 complete rollouts |
@@ -45,19 +45,29 @@ normalized, without subtracting a mean.
   true final observations. The inspected reference continues traces across truncation.
 - Reward accumulators reset **after** including the final reward at either episode
   boundary. Our running moments start without Gymnasium's small pseudocount.
-- Disabled autoreset records true final observations before partial resets. Only
-  newly reset observations update moments again and are normalized again.
-  Continuing states keep their stored normalized representation, so bootstrap
-  and next-current value inputs remain consistent. This corrects the earlier
-  full-batch re-normalization after partial resets. Continuation requires the
-  current checkpoint contract and uses the corrected collection behavior.
+- Disabled autoreset records raw true final observations before partial resets.
+  Resetting does not fit or apply observation statistics. One shared
+  `ObservationProcessor` processes inputs for the bare actor and critic networks.
+  It starts at identity without clipping, stays frozen through collection,
+  bootstrapping and PPO updates, then merges the rollout's raw current
+  observations once after `learner.update()`. This differs from the reference's
+  collection-time fitting and has not been benchmarked in a fresh run.
 - Evaluation uses separate fixed seeds and frozen observation statistics. The
   12.288M budget extends the reference's 10M budget; one seed is not its four-seed study.
 
 There is no explicit action clipping or squashing in this recipe. Rescaling is
 affine even outside `[-1, 1]`, as in the reference; MuJoCo's native actuator control
-limits still apply. Gaussian samples and their log probabilities stay together in
-the rollout. Native reward and termination definitions are not modified.
+limits still apply. `ActionProcessor` converts only environment commands.
+Gaussian samples and their log probabilities stay together in the rollout,
+alongside raw float32 observations and raw rewards. Gymnasium's
+`DtypeObservation` adapts state once before vectorization and in evaluation;
+MuJoCo's internal physics precision is unchanged. Running moments remain float64.
+Native reward and termination definitions are not modified.
+
+The learner's `prepare_targets()` evaluates bootstrap values, scales a reward
+copy, and calls GAE. Its optional `reward_scaler` owns training-only return
+statistics; the trainer schedules preparation and updates, then refreshes shared
+observation moments. Reward scaling is absent from the inference policy.
 
 ## Run
 
@@ -81,6 +91,9 @@ Each fresh output directory contains `config.json`, `metrics.jsonl`, TensorBoard
 `events/`, and `checkpoints/`. Every three completed rollouts (98,304 transitions),
 the trainer saves `last.pt` and a numbered checkpoint, and evaluates five episodes
 in each of deterministic and stochastic modes. It also saves at completion.
+Completion also exports `policy/` with `manifest.json`, `model.pt`, and
+`processor.pt`: the actor and its frozen input/output processing, without a
+critic, optimizer, reward scaler, or simulator state.
 There is no best-checkpoint selection. Interrupting a run may lose work since the
 last completed checkpoint; an interrupted partial PPO update is not saved.
 
@@ -98,17 +111,20 @@ and `optimizer_steps` record actual update work. All use the `diagnostics/` pref
 
 ```bash
 .venv/bin/python -m examples.gymnasium.humanoid.evaluate_humanoid \
-  "$RUN/checkpoints/last.pt" --episodes 10 --mode deterministic --render
+  "$RUN/policy" --episodes 10 --mode deterministic --render
 
 .venv/bin/python -m examples.gymnasium.humanoid.evaluate_humanoid \
-  "$RUN/checkpoints/last.pt" --episodes 10 --mode stochastic \
+  "$RUN/policy" --episodes 10 --mode stochastic \
   --video-dir "$RUN/videos/stochastic_01"
 ```
 
 Use a new video directory each time. `--render` and `--video-dir` are mutually
 exclusive. Evaluation reconstructs network sizes, action rescaling, log-std bounds,
-and frozen observation moments from the checkpoint, independent of current defaults.
-Older embedded-normalizer checkpoints remain readable by the evaluator.
+and frozen observation moments from the exported policy directory, independent
+of current training defaults. Without `--mode`, it uses the saved inference mode
+(deterministic in this example). Evaluation does not refit statistics or load
+training state. `.pt` training checkpoints are accepted by `--resume-from`, not
+the evaluator; there are no legacy-loading branches.
 
 ## Resume
 

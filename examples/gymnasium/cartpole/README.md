@@ -31,6 +31,7 @@ Every run requires a fresh output directory and writes:
 - `events/`: TensorBoard events.
 - `checkpoints/last.pt`: latest saved training state.
 - `checkpoints/step_<transitions>.pt`: periodic checkpoints.
+- `policy/`: final deployable actor, its input/output settings, and inference metadata.
 
 `CHECKPOINT_INTERVAL = 10` counts completed rollout updates, not transitions.
 Each default rollout contains 1,024 transitions. Periodic saves occur every ten
@@ -47,21 +48,25 @@ uv run tensorboard --logdir outputs
 
 ```bash
 uv run python -m examples.gymnasium.cartpole.evaluate_cartpole \
-  outputs/gymnasium/cartpole/ppo/seed_0/run_01/checkpoints/last.pt \
+  outputs/gymnasium/cartpole/ppo/seed_0/run_01/policy \
   --episodes 10 --seed 20000 --mode deterministic
 ```
 
 Use `--mode stochastic` to sample actions instead. Evaluation reconstructs the
-policy from checkpoint settings and reports undiscounted episode returns, their
+policy from its exported directory and reports undiscounted episode returns, their
 mean, and the population standard deviation across episodes. Episode seeds are
 consecutive, beginning at `--seed`. Results are saved under the run's
 `evaluations/` directory; `--output <path>` selects another JSON output path.
+Without `--mode`, evaluation uses the saved inference default (deterministic in
+these examples). The directory contains `manifest.json`, `model.pt`, and
+`processor.pt`; no critic or optimizer is loaded. Training checkpoints are only
+for resuming training.
 
 To record every evaluation episode, use a fresh video directory:
 
 ```bash
 uv run python -m examples.gymnasium.cartpole.evaluate_cartpole \
-  outputs/gymnasium/cartpole/ppo/seed_0/run_01/checkpoints/last.pt \
+  outputs/gymnasium/cartpole/ppo/seed_0/run_01/policy \
   --episodes 3 --seed 20000 --mode deterministic \
   --video-dir outputs/gymnasium/cartpole/ppo/seed_0/run_01/videos/eval_01
 ```
@@ -70,7 +75,7 @@ For an interactive window on a machine with a display:
 
 ```bash
 uv run python -m examples.gymnasium.cartpole.evaluate_cartpole \
-  outputs/gymnasium/cartpole/ppo/seed_0/run_01/checkpoints/last.pt \
+  outputs/gymnasium/cartpole/ppo/seed_0/run_01/policy \
   --episodes 3 --seed 20000 --mode deterministic --render
 ```
 
