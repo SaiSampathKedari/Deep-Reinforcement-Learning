@@ -43,6 +43,8 @@ The parallel file
                                                (explores) and an inference policy
     observation statistics update AFTER      observation statistics update DURING
       the learner update                       collection, step by step
+    no target networks                       target networks, refreshed every
+                                               target_update_interval updates
     resume continues whole rollouts          resume refills the empty replay first
 """
 

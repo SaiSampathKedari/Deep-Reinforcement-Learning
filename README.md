@@ -104,12 +104,12 @@ benchmark work, separate from having a runnable example.
 ## Library Structure
 
 - **Learning rules:** [algorithms/](src/deeprl/algorithms/) contains configs, target preparation, losses, and parameter updates. Learners use native PyTorch optimizers; NPG/TRPO perform their actor updates directly.
-- **Training lifecycle:** [train_on_policy.py](src/deeprl/training/train_on_policy.py) coordinates collection, learner target preparation and updates, evaluation, and checkpoint timing.
+- **Training lifecycle:** [train_on_policy.py](src/deeprl/training/train_on_policy.py) coordinates rollouts, learner target preparation and updates, evaluation, and checkpoint timing. [train_off_policy.py](src/deeprl/training/train_off_policy.py) coordinates replay collection, minibatch updates, target-network refresh, evaluation, and checkpoints.
 - **Data and targets:** [buffers.py](src/deeprl/buffers.py), [collectors.py](src/deeprl/collectors.py), and [advantages.py](src/deeprl/advantages.py) separate storage, interaction, and advantage estimation.
 - **Networks and preprocessing:** [policies.py](src/deeprl/policies.py) and [value.py](src/deeprl/value.py) wrap caller-supplied networks; [processors.py](src/deeprl/processors.py) handles shared input normalization and action conversion, composed with the model by [inference.py](src/deeprl/inference.py). Buffers retain raw observations; the trainer explicitly schedules statistics updates. Architectures stay with the task examples.
 - **Evaluation and logging:** [evaluate.py](src/deeprl/evaluate.py) and [logger.py](src/deeprl/logger.py) handle policy assessment, episode statistics, JSONL metrics, and optional TensorBoard output.
 - **State and continuation:** Concrete learners explicitly save/load their native component state. [learner_state.py](src/deeprl/learner_state.py) validates state keys and resume configuration; [checkpoint.py](src/deeprl/checkpoint.py) and [lifecycle.py](src/deeprl/lifecycle.py) handle checkpoint I/O, configuration, Torch RNG state, and provenance.
-- **Policy artifacts:** [policy_io.py](src/deeprl/policy_io.py) saves inference configuration, model weights, and actor-visible preprocessing state separately from training checkpoints. A task-local factory rebuilds the known architecture; loading needs no learner or optimizer.
+- **Policy artifacts:** [policy_io.py](src/deeprl/policy_io.py) saves inference configuration, model state, and observation statistics separately from training checkpoints. The acting model is an actor or DQN's online Q-network. A caller-supplied factory rebuilds that architecture; loading needs no learner or optimizer.
 
 Rollout buffers preserve the time/environment layout `(T, N)`. Replay buffers
 use flat FIFO transition storage. Both support fixed-shape tensors and
@@ -133,26 +133,30 @@ These are the only on-policy import paths; there are no compatibility shims.
 Examples export `policy/manifest.json`, `policy/model.pt`, and
 `policy/processor.pt` only after training returns successfully. A running or
 interrupted job is not guaranteed to have a current `policy/` export.
-The manifest declares the input/action spec, model
-configuration, processing, and inference defaults. The artifact excludes the
-critic, optimizers, and reward/value-target statistics. Exports require a fresh
-directory and do not overwrite an existing policy.
+The manifest declares the input/action spec, model configuration, action
+selector, processing settings, and inference defaults. The model file holds
+the actor's state or DQN's online Q-network state. Target networks, separate
+value networks, optimizers, and reward/value-target statistics are not part of
+the inference artifact. Exports require a fresh directory and do not overwrite
+an existing policy.
 
 `load_policy()` receives an explicit trusted model factory and expected model
 ID; it does not import code named in JSON. Task factories live in their network
-files. Evaluators use this artifact, frozen preprocessing, and the policy's
-`act()` interface. They report raw, undiscounted episode returns, with the
-resolved action mode and episode seeds.
+files. Built-in action selectors are restored from their saved names; custom
+selectors also require caller-supplied code and a matching ID. Evaluators use
+this artifact, fixed observation statistics, and the policy's `act()` interface.
+They report raw, undiscounted episode returns, with the resolved action mode
+and episode seeds.
 
-The rollout trainer saves `last.pt` and periodic `step_<transitions>.pt` files
-at completed-update boundaries. Checkpoints include learner/optimizer state,
-shared observation-processing state, learner-owned reward/value statistics,
-progress, supported Torch RNG state,
+The shared trainers save `last.pt` and periodic `step_<transitions>.pt` files
+after complete rollouts or off-policy collection/update cycles. Checkpoints
+include learner state (networks, optimizers, and any learner-owned statistics),
+shared observation-processing state, progress, supported Torch RNG state,
 configuration, and informational dependency/source provenance. The PPO examples
-also save the policy descriptor, without duplicating its weights or moments.
-Only the current
-checkpoint contract is supported, without schema versions, migrations, or legacy
-fallbacks. There is no automatic best-checkpoint selection.
+also supply a policy manifest for the checkpoint, without duplicating model
+state or observation statistics. Only the current checkpoint contract is
+supported, without schema versions, migrations, or legacy fallbacks. There is
+no automatic best-checkpoint selection.
 
 To evaluate a saved snapshot before a run finishes, export it to a new policy
 directory:
@@ -166,7 +170,7 @@ export_policy_from_checkpoint(
 )
 ```
 
-Then use the existing evaluator:
+Then use the CartPole PPO evaluator:
 
 ```bash
 uv run python -m examples.gymnasium.cartpole.evaluate_cartpole \
@@ -174,16 +178,28 @@ uv run python -m examples.gymnasium.cartpole.evaluate_cartpole \
   --episodes 10 --seed 20000
 ```
 
-Export uses the saved policy descriptor, actor weights, actor-visible observation
-statistics, action processing, and inference defaults without constructing a
-model or learner. Provenance records the snapshot's `global_step` as
-`training_step`. Checkpoints without the required descriptor or state fail;
-architecture and preprocessing are never inferred from current example defaults.
+Export uses the saved policy manifest, model state, observation statistics,
+action processing, and inference defaults without constructing a model or
+learner. It selects `learner["q_network"]` when the checkpoint's `algorithm` is
+`"dqn"` (both DQN and Double DQN), and `learner["policy"]` otherwise. A missing
+selected key is an error; the exporter never falls back to a target network.
+The exported observations and statistics include only ungrouped features and
+those in the `"actor"` group. This input-selection rule also applies to DQN's
+online Q-network, even though it has no separate actor.
+
+Provenance records the snapshot's `global_step` as `training_step`. Checkpoints
+without the required manifest or state fail; architecture and preprocessing
+are never inferred from current example defaults. Loading a DQN export requires
+a matching Q-network factory, and its saved `"greedy"` decision is restored
+automatically. The existing task evaluators use actor factories; there is not
+yet a DQN evaluation entry point.
 
 Resume restores learning state but starts **fresh environment episodes**;
-it does not restore the simulator's exact trajectory. Use `checkpoints/last.pt`
-with `--resume-from`, not as the evaluator's policy argument. Deterministic and
-stochastic evaluations remain separate measurements.
+it does not restore the simulator's exact trajectory. Off-policy checkpoints
+also omit replay data, so resumed runs refill an empty buffer before learning.
+In the PPO examples, use `checkpoints/last.pt` with `--resume-from`, not as the
+evaluator's policy argument. Deterministic and stochastic actor evaluations
+remain separate measurements; DQN's inference selector is always greedy.
 
 The [one-step CartPole tutorial](examples/gymnasium/cartpole/run_cartpole_one_step_actor_critic.py)
 is intentionally separate: it exports the same `policy/` artifact, without the shared
@@ -199,7 +215,7 @@ rollback.
 
 The DQN derivation separates generalized Q-learning into data collection,
 target-network refresh, and Q-function fitting. These independently scheduled
-operations guide the next off-policy implementation.
+operations guide the shared off-policy trainer and DQN learner.
 
 [![Generalized Q-learning: data collection, target-network refresh, and Q-function fitting](assets/generalized-q-learning.png)](mathematical_derivations/24_Deep-Q-Network.pdf)
 
