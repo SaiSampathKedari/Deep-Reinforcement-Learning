@@ -1,20 +1,21 @@
 """Save a trained policy as a folder, and load it back without the training code.
 
-A policy folder holds the inference settings, the actor's weights and the
-observation statistics, and nothing that is only needed for training (no
-critic, optimizers or reward scaler). It does not hold code: loading also
-needs the caller's model factory (the code that builds the network), its
-dependencies, and any custom action selector::
+A policy folder holds the inference settings, the inference model's state
+(an actor or DQN's online Q-network), and its observation statistics.
+Training-only components such as target networks, separate value networks,
+optimizers and reward scalers stay with the learner. The folder does not hold
+code: loading needs the caller's model factory (the code that builds the
+network), its dependencies, and any custom action selector::
 
     policy/
         manifest.json   # what the policy is: data spec, model, action rule, processing settings
-        model.pt        # the actor's weights
-        processor.pt    # observation statistics (mean, var, count) for the actor's features
+        model.pt        # inference model weights and persistent buffers
+        processor.pt    # observation statistics (mean, var, count) for inference inputs
 
 A manifest looks like this::
 
     {
-        "spec":                  {...},   # the actor's observations and the actions (a DataSpec)
+        "spec":                  {...},   # inference observations and actions (a DataSpec)
         "model":                 {"id": "examples.hopper.build_policy", "config": {"obs_dim": 11, ...}},
         "decision":              {"id": "distribution"},   # the action selector
         "observation_processor": {"normalize": ["state"], "epsilon": 1e-8, "clip": 10.0},  # or None
@@ -33,9 +34,11 @@ Three entry points:
 
 Rules that keep this safe and correct:
 
-* **Actor features only.** Privileged observations that only the critic
-  sees are left out of the spec and the statistics, because the deployed
-  policy does not have them.
+* **Inference inputs only.** The policy uses observations with no groups or
+  with the ``"actor"`` group. This selection also applies to DQN's online
+  Q-network, even though DQN has no separate actor. Other observations, such
+  as privileged inputs used only by a value network, are left out of the
+  exported spec and statistics.
 * **JSON describes, it never imports.** The loader never imports or runs
   code named by the manifest. The caller supplies the code that builds the
   model (``model_factory``). The caller's ``model_id`` must match the saved
@@ -104,11 +107,11 @@ def _json_copy(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _actor_spec(spec: DataSpec) -> DataSpec:
-    """Return the part of a spec the actor sees.
+    """Return the part of a spec used by the inference model.
 
     Keeps observations with no groups (seen by everyone) and observations in
-    the ``"actor"`` group. Drops critic-only (privileged) observations. The
-    actions are kept unchanged.
+    the ``"actor"`` group, for both actors and DQN's online Q-network. All
+    other observations are dropped; the actions are kept unchanged.
     """
     return DataSpec(
         tuple(
@@ -140,8 +143,8 @@ def validate_policy_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     """Check a policy manifest and return an independent copy of it.
 
     Checks the structure (exactly the seven fields) and the meaning: the
-    spec is valid and actor-only, and the processing settings can actually
-    be built for that spec.
+    spec contains only inference inputs and actions, and the processing
+    settings can actually be built for that spec.
 
     Args:
         manifest: A manifest, from ``describe_policy`` or ``manifest.json``.
@@ -161,8 +164,8 @@ def validate_policy_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("policy manifest has missing or unknown fields")
 
     # 2. The spec must be valid, with observations and actions, and hold only
-    #    features the actor sees. A deployed policy cannot require a feature
-    #    that only the critic had during training.
+    #    ungrouped or "actor" observations. A deployed policy cannot require
+    #    privileged inputs used only by a separate training network.
     spec = DataSpec.from_dict(data["spec"])
     if not spec.observations or not spec.actions:
         raise ValueError("policy spec must declare observations and actions")
@@ -238,17 +241,19 @@ def describe_policy(
     decision_id: str | None = None,
     provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the manifest for a live policy, without its weights.
+    """Build the manifest for a live policy, without model or processor state.
 
-    The manifest describes what the policy really does: the actor's
-    features, how the model is built, how actions are chosen, and its
-    processing settings. Training checkpoints store it too, so a policy
-    folder can be exported later (see ``export_policy_from_checkpoint``).
+    The manifest describes the inference inputs, how the model is built,
+    how actions are chosen, and the processing settings. The model id and
+    config are the caller's declarations; they are not inferred from the
+    network. Trainers can store this manifest in checkpoints for later
+    export (see ``export_policy_from_checkpoint``).
 
     Args:
-        policy: The policy to describe, usually ``learner.inference_policy``.
-        spec: The full training spec. Critic-only observations are left out
-            of the manifest.
+        policy: The policy to describe. On-policy learners expose
+            ``learner.inference_policy``; off-policy callers build it.
+        spec: The full training spec. Only ungrouped observations and those
+            in the ``"actor"`` group are retained, along with all actions.
         model_id: A name for the code that builds the model, for example
             ``"examples.hopper.build_policy"``. Loading checks it.
         model_config: The arguments that code needs, as plain JSON values,
@@ -278,9 +283,9 @@ def describe_policy(
     if decision_id is None:
         raise ValueError("a custom action selector requires an explicit decision_id")
 
-    # 2. Keep only the actor's features. If the spec has critic-only
-    #    features, an observation processor is required: it is what removes
-    #    them before the model sees the observations.
+    # 2. Keep only inference inputs. If the spec has other features, an
+    #    observation processor is required: it removes those features before
+    #    the model sees the observations.
     actor_spec = _actor_spec(spec)
     if policy.observation_processor is None and actor_spec.observations != spec.observations:
         raise ValueError(
@@ -288,9 +293,9 @@ def describe_policy(
         )
     spec = actor_spec
 
-    # 3. Describe the observation processing, limited to the actor. The
-    #    processor's actor features must be the spec's actor features, and
-    #    only actor features stay in the "normalize" list.
+    # 3. Describe processing for inference inputs only. The processor and
+    #    spec must select the same features, and only those features stay in
+    #    the "normalize" list.
     observation = None
     if policy.observation_processor is not None:
         processor = policy.observation_processor
@@ -321,7 +326,7 @@ def _processor_state(
     source: ObservationProcessor | None,
     manifest: dict[str, Any],
 ) -> dict[str, torch.Tensor]:
-    """Return the observation statistics of the actor's features only.
+    """Return the observation statistics for inference inputs only.
 
     The processor stores each feature's statistics under its position in
     the ``normalize`` list ("0", "1", ...). Dropping critic-only features can
@@ -332,16 +337,16 @@ def _processor_state(
     Args:
         source: The training processor (all features), or ``None``.
         manifest: The checked manifest, whose processor settings list the
-            actor's features.
+            inference inputs.
 
     Returns:
-        The state dict of an actor-only processor, or ``{}`` without a
+        The state dict of an inference-only processor, or ``{}`` without a
         processor.
     """
     if source is None:
         return {}
 
-    # 1. Build an empty processor with the manifest's actor-only settings.
+    # 1. Build an empty processor with the manifest's inference settings.
     exported = ObservationProcessor(
         DataSpec.from_dict(manifest["spec"]),
         **manifest["observation_processor"],
@@ -388,9 +393,14 @@ def save_policy(
     Writes ``manifest.json``, ``model.pt`` and ``processor.pt``. The folder
     must not exist yet; an existing policy is never overwritten.
 
+    The whole state dict of ``policy.model`` is saved, so that model should
+    contain only the network used to act: an actor or DQN's online Q-network.
+    Observation statistics are filtered to the inference inputs.
+
     Args:
         directory: The new folder, for example ``runs/hopper/policy``.
-        policy: The policy to save, usually ``learner.inference_policy``.
+        policy: The policy to save. On-policy learners expose
+            ``learner.inference_policy``; off-policy callers build it.
         spec: The full training spec (see ``describe_policy``).
         model_id: A name for the code that builds the model.
         model_config: The arguments that code needs, as plain JSON values.
@@ -417,7 +427,7 @@ def save_policy(
         provenance=provenance,
     )
 
-    # 2. Copy the actor's weights and the actor's observation statistics.
+    # 2. Copy the inference model's state and its observation statistics.
     model_state = _tensor_state(policy.model.state_dict())
     processor_state = _tensor_state(_processor_state(policy.observation_processor, manifest))
 
@@ -470,20 +480,28 @@ def export_policy_from_checkpoint(
     checkpoint_path: str | Path,
     directory: str | Path,
 ) -> None:
-    """Write a policy folder from an on-policy training checkpoint.
+    """Write a policy folder from an on-policy or DQN training checkpoint.
 
     Useful for exporting a policy from the middle of a run, or from a run
     that stopped early. The learner is not built: the checkpoint already
-    holds the manifest, the actor's weights and the observation statistics.
+    holds the manifest, the inference model's state and any observation
+    statistics.
 
-    Only what the actor needs is exported. Optimizers, the critic and the
-    reward scaler stay in the checkpoint. The result is the same kind of
-    folder as ``save_policy`` writes, and is loaded with ``load_policy``.
+    The acting model is exported: the actor for on-policy algorithms, or the
+    online Q-network for DQN and Double DQN. Optimizers, target networks,
+    separate value networks and reward scalers stay in the checkpoint. The
+    result is the same kind of folder as ``save_policy`` writes and is loaded
+    with ``load_policy``.
+
+    The model state comes from ``learner["q_network"]`` when the checkpoint's
+    ``algorithm`` is ``"dqn"``, and from ``learner["policy"]`` otherwise.
+    There is no fallback to another network if the selected key is missing.
 
     Args:
         checkpoint_path: The training checkpoint. It must contain
-            ``policy_manifest``, the actor's weights (``learner["policy"]``)
-            and the processing settings and statistics.
+            ``policy_manifest``, ``preprocessing_config``, the selected model
+            state, and observation statistics if observation processing was
+            enabled.
         directory: The new policy folder. It must not exist yet.
 
     Raises:
@@ -491,7 +509,7 @@ def export_policy_from_checkpoint(
             the manifest, or the statistics are invalid.
         FileExistsError: If ``directory`` already exists.
     """
-    # 1. Load and check the checkpoint, the manifest and the actor's weights.
+    # 1. Load and check the checkpoint, the manifest and the model's state.
     #    The saved action processing must match the manifest.
     checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
     validate_training_checkpoint(
@@ -499,9 +517,11 @@ def export_policy_from_checkpoint(
         required_keys=("policy_manifest", "preprocessing_config"),
     )
     manifest = validate_policy_manifest(checkpoint["policy_manifest"])
-    if "policy" not in checkpoint["learner"]:
-        raise ValueError("checkpoint is missing learner policy weights")
-    model_state = _tensor_state(checkpoint["learner"]["policy"])
+    # DQN acts with its online Q-network, never its lagging target network.
+    model_key = "q_network" if checkpoint["algorithm"] == "dqn" else "policy"
+    if model_key not in checkpoint["learner"]:
+        raise ValueError(f"checkpoint is missing learner {model_key} weights")
+    model_state = _tensor_state(checkpoint["learner"][model_key])
     preprocessing = checkpoint["preprocessing_config"]
     if preprocessing["action"] != manifest["action_processor"]:
         raise ValueError("checkpoint action processing does not match the policy manifest")
@@ -521,8 +541,8 @@ def export_policy_from_checkpoint(
         spec = DataSpec.from_dict(settings["spec"])
         source = ObservationProcessor(spec, **settings["config"])
 
-        # 2c. Its actor part must match the manifest: the same actor features
-        #     and the same settings.
+        # 2c. Its inference inputs and their processing settings must match
+        #     the manifest.
         actor_spec = DataSpec.from_dict(manifest["spec"])
         DataSpec(_actor_spec(spec).observations, ()).validate_compatible(
             DataSpec(actor_spec.observations, ()),
@@ -542,7 +562,7 @@ def export_policy_from_checkpoint(
             ):
                 raise ValueError("invalid observation processor statistics")
 
-    # 2e. Keep the statistics of the actor's features only.
+    # 2e. Keep the statistics for inference inputs only.
     processor_state = _tensor_state(_processor_state(source, manifest))
 
     # 3. Record when the checkpoint was taken, then write the same kind of
@@ -569,10 +589,10 @@ def load_policy(
 
     Args:
         directory: The policy folder.
-        model_factory: Trusted code that builds the actor network from the
+        model_factory: Trusted code that builds the inference model from the
             saved config, for example ``build_policy(config) -> nn.Module``.
-            It builds only the actor, never a learner, on the CPU, with the
-            same parameter dtypes as the saved weights.
+            It builds an actor or online Q-network, never a learner, on the
+            CPU, with the same parameter and buffer dtypes as the saved state.
         model_id: The identifier of ``model_factory``. It must equal the
             saved identifier. This compares strings only; the caller remains
             responsible for passing the trusted factory that matches it.
@@ -581,8 +601,8 @@ def load_policy(
             Built-in decisions need nothing here.
         decision_id: Only for a custom decision: its name, which must equal
             the saved one.
-        expected_spec: What the environment provides. If given, the saved
-            spec must match its actor part.
+        expected_spec: What the environment provides. If given, its actions
+            and ungrouped or ``"actor"`` observations must match the saved spec.
 
     Returns:
         The policy in evaluation mode, with the manifest attached as
@@ -596,7 +616,7 @@ def load_policy(
 
     # 1. Read and check the manifest before building or loading anything.
     #    The model id must match the caller's factory, and the saved spec
-    #    must match what the environment provides.
+    #    must match the environment's inference inputs and actions, if given.
     directory = Path(directory)
     manifest = validate_policy_manifest(
         json.loads(
