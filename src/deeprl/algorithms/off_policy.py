@@ -1,26 +1,61 @@
 """Shared settings and the learner interface for off-policy algorithms.
 
-Off-policy algorithms learn from replayed transitions, which may have been
-collected by earlier behaviour policies. This module holds what they share:
+Off-policy algorithms (DQN, DDPG, TD3, SAC) learn from a replay buffer: a
+large store of past transitions, many of them collected by older versions
+of the policy. This module holds what those algorithms share:
 
-* ``OffPolicyConfig``: run length, replay capacity, sampling and update settings.
-* ``OffPolicyLearner``: the base class each algorithm extends. Concrete learners
-  own their networks, optimizers, losses and target-network updates.
+* ``OffPolicyConfig``: run length, replay size, sampling, update and
+  target-network settings.
+* ``OffPolicyLearner``: the base class each algorithm extends. The concrete
+  learner owns its networks, optimizers, losses and target networks.
 
 One collection/learning cycle, as run by ``training/train_off_policy.py``::
 
-    collect transitions   (behaviour_policy, collect_transitions)
-    update statistics     (obs_processor.update, after each vector step, by the trainer)
-    handle step events    (learner.on_environment_step, after each vector step)
-    sample replay         (replay_buffer.sample, after learning_starts)
-    update the networks   (learner.update, once per sampled minibatch)
+    collect transitions    (behaviour_policy, collect_transitions)
+    update statistics      (obs_processor.update, after each vector step)
+    once learning_starts fresh transitions have been collected,
+    repeat gradient_steps times:
+        sample replay      (replay_buffer.sample)
+        update networks    (learner.update, on that one minibatch)
+        refresh targets    (learner.update_targets, only when due)
 
-The trainer owns collection, progress, reporting and checkpoints. The learner
-owns target preparation and optimization. Unlike on-policy learning, there
-is no shared target stage (like GAE) here: every algorithm builds its own
-Bellman target (DQN takes the best next Q-value, TD3 the smaller of two
-critics, SAC adds an entropy bonus), and it must be recomputed for every
-sampled minibatch with the current target networks.
+A refresh happens right after the update that makes it due, before the
+next minibatch is sampled, not once at the end of the learning phase.
+
+Who does what
+-------------
+* The trainer owns the schedule: collection, when to learn, when to refresh
+  target networks, progress counters, logging and checkpoints.
+* The learner owns the math: networks, Bellman targets, losses, optimizers,
+  and how its target networks are refreshed.
+
+Target networks
+---------------
+A Bellman target such as ``reward + gamma * Q(next_state)`` uses the
+network's own estimate of the next state. If that estimate came from the
+network being trained, every update would also move the target it is
+chasing, and learning can oscillate or diverge. So each algorithm keeps a
+lagging copy, the target network, and uses it for the next-state estimate.
+
+A refresh moves that copy toward the online network: a full copy
+(``tau=1``) once in a while, or a small step (``tau`` < 1) often. The
+trainer decides when (every ``target_update_interval`` completed minibatch
+updates); the learner decides how (which networks have targets, and what to
+do with buffers that are not parameters). Keeping the schedule in the trainer
+means every algorithm counts the same way, and a resumed run needs no extra
+counter: the saved ``progress.gradient_step`` already says where the
+schedule stands.
+
+Bellman targets
+---------------
+Unlike on-policy learning, there is no shared target stage (like GAE)
+here. Every algorithm builds its own Bellman target, recomputed for each
+sampled minibatch, because the networks change after every update and a
+stored target would soon be out of date. DQN uses the target network's
+largest next-state Q-value; Double DQN picks the next action with the online
+network and scores it with the target network. The interface also leaves
+room for TD3 (the smaller of two target critics) and SAC (an
+entropy-adjusted target).
 """
 
 from __future__ import annotations
@@ -42,8 +77,8 @@ from deeprl.stats import TrainingProgress, TrainingStats
 class OffPolicyConfig:
     """Settings shared by off-policy algorithms.
 
-    Each algorithm's own config extends this class with its optimization,
-    exploration and target-network settings.
+    Each algorithm's own config adds optimization and exploration settings,
+    and may override the shared defaults.
 
     Attributes:
         total_timesteps: Total environment transitions to collect, counted
@@ -71,25 +106,48 @@ class OffPolicyConfig:
         learning_starts: Fresh transitions collected before learning starts.
             Minibatches drawn from a nearly empty buffer would train on the
             same few transitions over and over. Resume starts with empty
-            replay and collects this many again.
+            replay and collects at least this many again. The threshold is
+            checked after collection, so learning starts at the end of the
+            first cycle that reaches it. 0 enables the first learning phase
+            immediately after its collection phase.
         train_freq: T, vector steps per collection cycle. With N environments,
             a full cycle inserts T * N transitions; each step inserts N.
-        gradient_steps: Replay-minibatch updates per collection cycle once
-            learning is enabled. Actor delays and target refreshes are
-            scheduled by the concrete learner, not this setting. Together
-            with ``train_freq`` it sets the replay ratio: about
+        gradient_steps: Calls to ``learner.update`` per collection cycle once
+            learning is enabled, each with a freshly sampled minibatch. A
+            learner may report a skipped update. Actor delays belong to the
+            concrete learner; target refreshes use their own interval below.
+            Together with ``train_freq`` it sets the replay ratio for full
+            cycles after warm-up:
             ``gradient_steps / (train_freq * N)`` minibatch updates per
             collected transition. That counts update calls. Each call
             samples ``batch_size`` transitions, so the sampled-transition
             ratio is ``batch_size`` times larger, and individual replay
             entries are sampled different numbers of times.
+        tau: How far one refresh moves the target networks toward the
+            online networks, in (0, 1]. For parameters, each refresh applies
+            ``target = (1 - tau) * target + tau * online``. 1 is a full
+            ("hard") copy. The default 0.005 is a small "soft" step, so
+            the target trails the online network smoothly. Buffers that are
+            not parameters (such as BatchNorm statistics) are each
+            learner's choice; DQN copies them.
+        target_update_interval: Completed minibatch updates between target
+            refreshes. 1 refreshes after every completed update. It counts
+            ``progress.gradient_step``, so skipped updates and environment
+            steps do not count, and the count continues on resume. Typical
+            settings: soft updates every update (small ``tau``, interval
+            1), as in DDPG and SAC; soft updates every 2 critic updates, as
+            in TD3, which delays its actor and target updates together; or
+            a hard copy (``tau=1``) every few thousand updates, as in the
+            2015 DQN paper (every 10,000). A TD3 learner should use this
+            interval for its delayed actor update too, so the actor step and
+            the target refresh land on the same minibatch.
     """
 
     # Run control.
     total_timesteps : int          = 500_000  # Total transitions across all environments.
     seed            : int          = 0
     device          : torch.device = torch.device("cpu")
-    log_every       : int          = 1_000    # Transition reporting interval; 0 disables.
+    log_every       : int          = 1_000    # Periodic report interval; 0 disables periodic reports.
 
     # Discount and replay storage.
     gamma           : float        = 0.99       # Discount factor for Bellman targets.
@@ -98,26 +156,32 @@ class OffPolicyConfig:
     batch_size      : int          = 256        # Transitions sampled per learner update.
 
     # Collection and learning schedule.
-    learning_starts : int          = 1_000  # Fresh transitions before learning/refilling.
+    learning_starts : int          = 1_000  # Fresh transitions before learning; reapplied on resume.
     train_freq      : int          = 1      # Vector steps collected per learning phase.
-    gradient_steps  : int          = 1      # Replay-minibatch updates per learning phase.
+    gradient_steps  : int          = 1      # Replay-minibatch update calls per learning phase.
+
+    # Target networks: the learner applies tau, the trainer the interval.
+    tau                    : float = 0.005  # Refresh step size; 1 is a full copy.
+    target_update_interval : int   = 1      # Completed updates between refreshes.
 
     def __post_init__(self) -> None:
         """Check the settings when the config is created.
 
         Raises:
-            ValueError: If a count is not a large enough integer, or gamma
-                is not a finite number between 0 and 1.
+            ValueError: If a count, gamma or tau is invalid.
             TypeError: If device or replay_device is not a torch.device.
         """
         # 1. Counts must be whole numbers (booleans are rejected) and at
-        #    least the given minimum.
+        #    least the given minimum. target_update_interval needs at least
+        #    1: the trainer checks ``gradient_step % target_update_interval``,
+        #    and 0 would divide by zero.
         for name, minimum in (
             ("total_timesteps", 1),
             ("buffer_size", 1),
             ("batch_size", 1),
             ("train_freq", 1),
             ("gradient_steps", 1),
+            ("target_update_interval", 1),
             ("seed", 0),
             ("learning_starts", 0),
             ("log_every", 0),
@@ -143,7 +207,18 @@ class OffPolicyConfig:
                 f"gamma must be finite and between 0 and 1, got {self.gamma!r}"
             )
 
-        # 3. Both devices must be torch.device objects (a plain string such as
+        # 3. tau must be a finite number in (0, 1]. With 0 the target would
+        #    never move from its initial weights; above 1 a refresh would
+        #    overshoot past the online network.
+        if (
+            isinstance(self.tau, bool)
+            or not isinstance(self.tau, Real)
+            or not isfinite(self.tau)
+            or not 0.0 < self.tau <= 1.0
+        ):
+            raise ValueError(f"tau must be finite and in (0, 1], got {self.tau!r}")
+
+        # 4. Both devices must be torch.device objects (a plain string such as
         #    "cuda" is rejected). They may differ: replay can stay on the CPU
         #    while the networks and sampled batches use the GPU.
         for name in ("device", "replay_device"):
@@ -161,15 +236,14 @@ class OffPolicyLearner(ABC):
     What this base class provides:
 
     * Checks for config changes when resuming.
-    * ``on_environment_step``: an optional collection-time event, a no-op by
-      default. A learner may use it for environment-step target refreshes,
-      for example a DQN that copies its network into the target network
-      every C environment steps.
 
     What each algorithm must implement:
 
     * ``update``: its own training step on one sampled replay minibatch,
-      including targets, losses and any delayed actor or target updates.
+      including Bellman targets, losses and any delayed actor updates.
+    * ``update_targets``: move its target networks one step toward the
+      online networks. The trainer decides when to call it; the learner
+      only decides how.
     * ``state_dict`` / ``load_state_dict``: save and restore its networks,
       optimizers and other learning state, explicitly. The trainer saves the
       rest of a checkpoint (progress, random-number state, observation
@@ -182,8 +256,9 @@ class OffPolicyLearner(ABC):
     when the on-policy base does? Off-policy algorithms have no common actor:
     DQN acts by picking the action with the highest Q-value, TD3 has an
     actor that outputs actions directly, SAC has one that outputs a
-    distribution. Each also explores differently. So the caller builds both
-    policies around the learner's networks.
+    distribution. Each also explores differently. So the caller supplies both
+    policies around the learner's networks; a learner's behaviour-policy
+    method can be passed directly.
 
     Args:
         cfg: The algorithm's config.
@@ -281,23 +356,31 @@ class OffPolicyLearner(ABC):
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # 3. Off-policy collection events
+    # 3. Target-network updates
     # ------------------------------------------------------------------
-    def on_environment_step(self, *, progress: TrainingProgress) -> None:
-        """Optional work after each vector step, using post-collection counters.
+    @abstractmethod
+    def update_targets(self) -> None:
+        """Move the target networks one step toward the online networks.
 
-        Override for work on an environment-step clock, for example a DQN
-        that copies its network into the target network every C environment
-        steps. Work on a gradient-step clock, such as TD3's delayed actor
-        update or the soft target updates of TD3 and SAC, belongs inside
-        ``update``. The default does nothing; there is no universal
-        target-update schedule. The trainer calls this without gradients.
+        Why target networks exist (see the module docstring): the Bellman
+        target uses a lagging copy, so that an update does not also move
+        the target it is chasing. This method lets that copy catch up a
+        little.
 
-        Args:
-            progress: Counters after the vector step. global_step includes
-                the newly collected N transitions; no replay update has run
-                for this step yet.
+        How (the learner's job): one call is one refresh, using
+        ``cfg.tau``. For parameters,
+        ``target = (1 - tau) * target + tau * online``; ``tau=1`` is a
+        full copy. The learner chooses the online/target pairs (DQN: one
+        Q-network; TD3: an actor and two critics) and what to do with buffers
+        that are not parameters, such as BatchNorm statistics.
+
+        When (the trainer's job): right after a completed minibatch update
+        that brings ``progress.gradient_step`` to a multiple of
+        ``cfg.target_update_interval``, inside ``torch.no_grad()``. Skipped
+        updates and environment steps never trigger it. So an implementation
+        keeps no schedule of its own and takes no optimizer steps here.
         """
+        raise NotImplementedError
 
     # ------------------------------------------------------------------
     # 4. Algorithm-specific parameter updates
@@ -311,10 +394,26 @@ class OffPolicyLearner(ABC):
     ) -> TrainingStats:
         """Process one replay minibatch using pre-update training progress.
 
-        Own the losses, optimizer steps and any gradient-driven target updates.
-        Return gradient_steps=1 for a completed minibatch update, or 0 if skipped;
-        multiple optimizer steps on that batch still count as one update (for
-        example, TD3's critic step and delayed actor step on the same batch).
+        Own the losses and optimizer steps, including delayed actor updates.
+        Do not refresh target networks here; the trainer calls
+        ``update_targets`` after this method returns, when a refresh is due.
+
+        Delayed actor updates (TD3): ``progress`` holds the counts from
+        before this update. If this update completes, ``gradient_step``
+        becomes ``progress.gradient_step + 1``, and the trainer refreshes
+        targets when that number is a multiple of
+        ``target_update_interval``. So test the same number for the
+        delayed actor step, after a successful critic update:
+        ``(progress.gradient_step + 1) % cfg.target_update_interval == 0``.
+        The actor step then comes first, and the target refresh follows on
+        the same minibatch.
+
+        Return ``gradient_steps=1`` for a completed minibatch update, or 0 if
+        skipped. Multiple optimizer steps on that batch still count as one
+        update (for example, a critic step and delayed actor step on the
+        same batch). This count differs from ``progress.update``, which
+        counts completed collection/learning cycles, including warm-up.
+
         For collection, the trainer puts the inference policy's modules in
         evaluation mode; it does not touch separate critics or target
         networks. Each learner sets the modes its networks need here.

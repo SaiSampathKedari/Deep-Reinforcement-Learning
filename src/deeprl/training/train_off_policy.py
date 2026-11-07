@@ -1,46 +1,66 @@
-"""The training loop for off-policy algorithms (DQN, DDPG, TD3, SAC).
+"""The shared off-policy training loop, currently used by DQN.
 
 The idea
 --------
-Off-policy training repeats three things until the step budget is used up::
+Off-policy training repeats a short cycle until the step budget is used up::
 
-    1. play    step all N environments train_freq times with the behaviour
-               policy (which explores), and store every transition in a
-               large replay buffer
-    2. learn   draw gradient_steps random minibatches from the replay buffer
-               and update the learner on each one
-    3. record  log, evaluate, save a checkpoint
+    1. play     step all N environments train_freq times with the behaviour
+                policy (which explores), and store every transition in a
+                large replay buffer
+    2. learn    gradient_steps times: draw a random minibatch from replay
+                and update the learner on it
+    3. refresh  (inside step 2) after every target_update_interval completed
+                updates, move the target networks toward the online ones
+    4. record   log, evaluate, save a checkpoint
 
-Why keep old data? Off-policy methods learn a value function (Q) from the
-Bellman equation, which holds for any transition, no matter which policy
-collected it. So old experience stays useful, and reusing it many times
-makes these methods sample-efficient. Drawing minibatches at random from a
-large buffer also breaks the strong correlation between consecutive steps,
-which helps keep the updates stable (it does not guarantee it). This is
-the "experience replay" of DQN (Mnih et al., 2015).
+Learning waits until learning_starts fresh transitions have been collected
+(the warm-up). Nothing is thrown away after a cycle: transitions stay in
+replay until it is full, and then the oldest are overwritten first.
+
+Why keep old data? Off-policy methods form Bellman targets from stored
+state/action/reward/next-state transitions; they do not require those
+transitions to come from the current behaviour policy. So old experience
+stays useful, and reusing it can make learning sample-efficient. Drawing
+minibatches at random from a large buffer also reduces the correlation
+between consecutive training samples, which helps keep updates stable
+(it does not guarantee it). This is the "experience replay" of DQN
+(Mnih et al., 2015).
+
+Why target networks? A Bellman target, reward + gamma * Q(next state),
+uses the network's own estimate of the next state. If the network being
+trained also produced that estimate, every update would move the target it
+is chasing, and learning can oscillate or diverge. So the learner keeps a
+lagging copy (the target network) for that estimate, and this trainer tells
+it when to catch up. The schedule counts completed minibatch updates
+(``progress.gradient_step``), not environment steps, so it means the same
+thing for every algorithm, and a resumed run continues it from the saved
+count.
 
 Two policies
 ------------
 * The **behaviour policy** acts while collecting data. It explores:
-  epsilon-greedy for DQN, added noise for DDPG and TD3, sampling for SAC.
+  DQN uses epsilon-greedy actions. Other algorithms can use added noise
+  (DDPG, TD3) or sample a distribution (SAC).
 * The **inference policy** is the plain policy that is evaluated, saved
   and deployed. It skips the behaviour policy's extra exploration (no
   epsilon, no added noise). It is not necessarily deterministic: the
   evaluator asks for deterministic or stochastic actions, as configured.
 
-Both use the same network and the same observation processor, so they see
-inputs the same way. The caller builds both (on ``learner.cfg.device``);
-the trainer never moves trained modules.
+Both must use the learner's same action-producing network and observation
+processor, so they see inputs the same way. The caller supplies both on
+``learner.cfg.device``; a learner's behaviour-policy method can be passed
+directly. The trainer never moves trained modules.
 
 Who does what
 -------------
-* This trainer owns the **schedule**: when to collect, learn, log,
-  evaluate and save, and the step counters (``TrainingProgress``).
+* This trainer owns the **schedule**: when to collect, learn, refresh targets,
+  log, evaluate and save, and the step counters (``TrainingProgress``).
 * The learner owns the **math**: losses, reward transforms, target
-  networks, delayed updates, optimizers.
+  networks and their interpolation, delayed actor updates, optimizers.
 * ``collect_transitions`` owns **stepping the environments**.
-* The caller owns the environments, the networks, both policies and,
-  optionally, the logger; this trainer never closes what it did not create.
+* The caller supplies the environments, learner, both policies and,
+  optionally, the logger. The trainer creates the replay buffer and, when
+  needed, a logger; it never closes objects supplied by the caller.
 
 The parallel file
 -----------------
@@ -55,6 +75,8 @@ The parallel file
                                                (explores) and an inference policy
     observation statistics update AFTER      observation statistics update DURING
       the learner update                       collection, step by step
+    no target networks                       target networks, refreshed every
+                                               target_update_interval updates
     resume continues whole rollouts          resume refills the empty replay first
 """
 
@@ -115,7 +137,7 @@ def _validate_setup(
 
     Raises:
         ValueError: If a setting does not fit.
-        TypeError: If the environments do not return tensors.
+        TypeError: If the environment wrapper chain has no ``NumpyToTorch``.
     """
     cfg = learner.cfg
     num_envs = envs.num_envs
@@ -161,12 +183,12 @@ def _validate_setup(
 def _preprocessing_config(
     inference_policy: InferencePolicy,
 ) -> dict[str, Any]:
-    """Write down how observations and actions are processed, as a JSON-compatible dictionary.
+    """Describe observation and action processing as a JSON-compatible dictionary.
 
     Why: trained weights only make sense together with the processing they
-    were trained with. A network trained on normalized inputs is useless on
-    raw ones; a policy trained with actions rescaled to [-0.4, 0.4] acts
-    wrongly with another scale. So this description goes into every
+    were trained with. Feeding raw inputs to a network trained on normalized
+    ones changes its predictions; changing an action scale changes the
+    commands sent to the environment. So this description goes into every
     checkpoint, and a resumed run must match it exactly.
 
     Returns:
@@ -200,15 +222,15 @@ def _validate_policy_description(
     stores it in checkpoints next to the learner state. If the manifest
     disagreed with what the policy actually does (say it lists
     ``normalize=["state"]`` but the processor normalizes nothing), a
-    policy rebuilt from it would be wrong. So: describe
-    the live policy again and require an exact match.
+    policy rebuilt from it would be wrong. So describe the live policy again
+    and require an exact match.
 
-    What this can check: everything visible on the live policy, such as
-    the actor's features, the observation and action processing, the
-    action selector and the default mode. What it cannot check: the model
-    id and the model config. They are copied from the manifest into the
-    new description, so they remain the caller's own declarations and
-    must be right to begin with.
+    This checks the supported inference settings: feature selection by the
+    observation processor, observation and action processing, the action
+    selector and the default mode. It does not reconstruct or test the model.
+    The data spec, model id/config and custom decision id are supplied from
+    the manifest, so their compatibility with the network and custom code
+    remains the caller's responsibility.
 
     Returns:
         The checked manifest.
@@ -219,8 +241,8 @@ def _validate_policy_description(
     # 1. The manifest itself must be well-formed.
     manifest = validate_policy_manifest(manifest)
 
-    # 2. Describe the live policy, using the manifest's own names and model
-    #    config (those cannot be read from the policy object).
+    # 2. Describe the live policy, using the manifest's declared data spec,
+    #    model id/config and decision id where these are caller-owned.
     actual = describe_policy(
         inference_policy,
         spec=DataSpec.from_dict(manifest["spec"]),
@@ -364,16 +386,17 @@ def _checkpoint_state(
     provenance: dict[str, Any] | None,
     policy_manifest: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Collect everything needed to resume into one dictionary (no file is written).
+    """Collect the learning state for a warm restart (no file is written).
 
     Saved: the learner's state and config, the counters, the random-number
-    state, the run config and provenance, plus what the trainer owns: N, the
-    processing settings, the observation statistics and the policy manifest.
+    state, the run config and optional provenance, plus what the trainer
+    records: N, processing settings, observation statistics and the optional
+    policy manifest. The caller still constructs the learner and environments.
 
     Not saved:
 
-    * the replay buffer: it can be gigabytes (a million transitions), so a
-      resumed run refills it instead (see ``learning_starts``);
+    * the replay buffer: large buffers can occupy gigabytes, so a resumed run
+      collects fresh experience instead (see ``learning_starts``);
     * the environments' state: a resumed run starts new episodes.
 
     Returns:
@@ -397,8 +420,8 @@ def _checkpoint_state(
     if obs_processor is not None:
         checkpoint["observation_processor"] = obs_processor.state_dict()
 
-    # 3. The policy manifest, checked again against the live policy so the
-    #    saved copy can never drift from what the policy really does.
+    # 3. Check the policy manifest's supported inference settings again
+    #    against the live policy before saving it.
     if policy_manifest is not None:
         checkpoint["policy_manifest"] = _validate_policy_description(
             inference_policy, policy_manifest,
@@ -429,20 +452,32 @@ def train_off_policy(
 ) -> MetricHistory:
     """Train an off-policy learner: collect a little, learn from replay, repeat.
 
-    One cycle collects ``train_freq`` vector steps (N transitions each) into
-    the replay buffer, then runs ``gradient_steps`` minibatch updates. The
-    two together set the replay ratio: ``gradient_steps / (train_freq * N)``
-    minibatch updates per collected transition. That counts update calls.
-    Each call draws ``batch_size`` transitions at random, so the number of
-    sampled transitions per collected one is ``batch_size`` times larger,
-    and individual transitions are drawn different numbers of times (some
-    often, some never). Learning only starts after ``learning_starts`` fresh
-    transitions have been collected by this call.
+    One cycle:
+
+    1. Collect ``train_freq`` vector steps (N transitions each) into replay.
+    2. Once learning has started, call ``learner.update`` ``gradient_steps``
+       times, each on a freshly sampled minibatch, and refresh the target
+       networks whenever a refresh is due (see "Target updates" below).
+
+    Learning starts at the end of the first cycle that reaches
+    ``learning_starts`` fresh transitions in this call. With
+    ``learning_starts=0``, the first cycle still collects before it learns.
+
+    Replay ratio: for full cycles after warm-up, there are
+    ``gradient_steps / (train_freq * N)`` update calls per collected
+    transition. For example, N=4, train_freq=1 and gradient_steps=1 give one
+    update per 4 new transitions (the 2015 DQN paper also updated once every
+    4 actions). Each call samples ``batch_size`` transitions, so the number
+    of sampled transitions per collected one is ``batch_size`` times larger.
+    Sampling is random, so some transitions are drawn often and some never.
+    A call the learner skips still samples replay but does not count as a
+    completed update.
 
     The budget is rounded down to whole vector steps (not whole cycles): the
-    last cycle may be shorter than ``train_freq`` and still runs its
-    updates. Minibatches are drawn uniformly with replacement, so
-    ``batch_size`` may even be larger than the number of stored transitions.
+    last cycle may be shorter than ``train_freq`` and still runs its full
+    learning phase if the warm-up threshold has been reached. Minibatches
+    are drawn uniformly with replacement, so ``batch_size`` may even be
+    larger than the number of stored transitions.
 
     The behaviour policy:
         Called as ``behaviour_policy(observations, global_step)`` with raw
@@ -459,33 +494,51 @@ def train_off_policy(
         its statistics, once, right after that step (see step 4 for why
         this is fine here). Final observations of episodes, and the last
         observation of the run, are never acted on, so they are not
-        counted. The
-        statistics stay fixed during each learning phase, so the learner
-        processes current and next observations with the same snapshot.
-        Losses, reward transforms, delayed updates and target networks
-        belong to the learner. Work tied to environment steps goes in
-        ``learner.on_environment_step``.
+        counted. The statistics stay fixed during each learning phase, so
+        the learner processes current and next observations with the same
+        snapshot.
+        Losses, reward transforms, delayed actor updates and target networks
+        belong to the learner.
+
+    Target updates:
+        After every completed minibatch update, the trainer checks whether
+        the completed-update count (``progress.gradient_step``) is now a
+        multiple of ``target_update_interval``. If so, it calls
+        ``learner.update_targets()`` once, before sampling the next
+        minibatch. Example with interval 3: refreshes follow updates 3, 6,
+        9, ..., counted across cycles and across a resume. Skipped updates
+        and environment steps never trigger a refresh. The learner applies
+        ``tau``: 1 is a full copy, the default 0.005 a small soft step, and
+        it decides what to do with target buffers. A TD3 learner should use
+        the same interval for its delayed actor step, so that step comes
+        first and the refresh follows on the same minibatch.
 
     Resuming (``resume_from``) is a warm restart:
         Restored: the learner (networks, target networks, optimizers), the
         observation statistics, the counters and PyTorch's random-number
-        state. Not restored: the replay buffer, which starts empty and is
-        refilled with ``learning_starts`` fresh transitions before learning
-        continues, and the episodes, which start fresh. Schedules that use
-        the step count (exploration, target updates) continue where they
-        were; epsilon does not jump back to its start value.
-        ``total_timesteps`` is the budget for the whole run, not extra
-        steps. Private random generators or exploration state must be saved
-        by their owner in the learner state. The run is not identical to an
-        uninterrupted one.
+        state. Not restored: replay, which starts empty, or the episodes,
+        which start fresh. At least ``learning_starts`` new transitions are
+        collected before learning continues. DQN's epsilon follows the
+        cumulative environment-transition count, so replay refill does not
+        restart its exploration schedule or force epsilon back to 1.
+        Target scheduling uses the saved completed-minibatch count, which
+        pauses during refill; no separate target counter is needed. Saved
+        target weights are restored, not reset to online weights.
+
+        The caller rebuilds the same environment, networks and processing.
+        ``total_timesteps`` is the budget for the whole run, not extra steps.
+        CPU and selected-device CUDA random-number states are restored, when
+        available; Python, NumPy and simulator generators are not. Private
+        generators or exploration state belong in the learner's saved state
+        if they must continue. This is not an exact uninterrupted trajectory.
 
     Checkpoints:
         Taken only after a complete cycle (warm-up cycles count too), never
-        in the middle of one. ``last.pt`` holds the latest saved completed
-        cycle;
-        ``step_<global_step>.pt`` files are kept every
-        ``checkpoint_interval`` cycles; the final cycle always writes
-        ``last.pt``. An interrupted cycle is not saved.
+        in the middle of one. Every ``checkpoint_interval`` cycles, both
+        ``last.pt`` and a historical ``step_<global_step>.pt`` are written.
+        The final cycle also writes ``last.pt``; ``checkpoint_interval=None``
+        writes only that final checkpoint. These writes require a
+        ``checkpoint_dir``. An interrupted cycle is not saved.
 
     Args:
         envs: N vectorized environments wrapped in ``NumpyToTorch`` and
@@ -508,16 +561,18 @@ def train_off_policy(
             many cycles (``last.pt`` is written at the same times). ``None``
             writes only ``last.pt``, at the end.
         run_config: Optional experiment settings stored in checkpoints as a
-            JSON-compatible dictionary. When resuming without one, the checkpoint's own is
-            reused.
+            JSON-compatible dictionary. When resuming without one, the
+            checkpoint's own is reused. This is recorded metadata; the
+            caller checks environment and network compatibility, for example
+            with ``validate_run_config`` before calling the trainer.
         resume_from: A checkpoint to continue from.
         policy_manifest: Optional ``describe_policy`` output, stored in
             checkpoints. It describes the inference policy; it does not
             dictate the names of the networks in the learner's state.
-            Note: ``export_policy_from_checkpoint`` currently also needs
-            the actor's weights under ``learner["policy"]``, which
-            off-policy learners are not required to provide, so not every
-            off-policy checkpoint can be exported yet.
+            For DQN, ``export_policy_from_checkpoint`` uses the saved online
+            ``learner["q_network"]`` weights; the other supported layout is
+            ``learner["policy"]``. Different state layouts need explicit
+            support in the exporter.
 
     Returns:
         The logger's in-memory metric history.
@@ -525,7 +580,7 @@ def train_off_policy(
     Raises:
         ValueError: If the setup or the checkpoint does not fit this run, or
             the learner reports an invalid gradient step count.
-        TypeError: If the environments do not return tensors.
+        TypeError: If the environment wrapper chain has no ``NumpyToTorch``.
     """
     # ------------------------------------------------------------------
     # 0. Validate the run
@@ -601,7 +656,8 @@ def train_off_policy(
     # Learning waits for learning_starts fresh transitions from this call.
     # Why: minibatches drawn from a nearly empty buffer would train on the
     # same few transitions again and again. On resume the buffer is empty
-    # again, so it is counted from the restored step, not from zero.
+    # again, so this threshold is counted from the restored step. Exploration
+    # still receives cumulative global_step; its clock is not reset here.
     learning_start_step = progress.global_step + cfg.learning_starts
 
     # Use the caller's logger, or create one. A logger created here must be
@@ -615,8 +671,8 @@ def train_off_policy(
         # 3. Restore the saved state and start fresh episodes
         # --------------------------------------------------------------
         # Seed PyTorch for exploration and minibatch sampling. (The networks
-        # already exist; their initial weights were seeded by the caller,
-        # before building them.)
+        # already exist; the caller must seed before building them to make
+        # their initial weights reproducible too.)
         seed_torch(cfg.seed)
 
         # On resume: load the learner and the statistics, and let the logger
@@ -670,8 +726,7 @@ def train_off_policy(
             inference_policy.eval()
 
             # One vector step at a time, so that after every step the
-            # trainer can update the statistics, call the learner's per-step
-            # hook and log.
+            # trainer can update statistics and log.
             for _ in range(num_steps):
                 # Copy the current observations before stepping. They are
                 # needed for the statistics after the step, but some vector
@@ -710,34 +765,31 @@ def train_off_policy(
                 if obs_processor is not None:
                     obs_processor.update(fresh_observations)
 
-                # Work that runs on an environment-step clock, for example
-                # DQN copying its network into the target network every C
-                # environment steps. It is bookkeeping, not learning, so it
-                # runs without gradients.
-                with torch.no_grad():
-                    learner.on_environment_step(progress=progress)
-
                 # Training episodes that ended in this step. [0] removes the
                 # time axis of size 1, leaving shape (N,).
                 logger.log_step(rewards[0], dones[0], progress=progress)
 
             # ----------------------------------------------------------
-            # 5. Learn: update the learner on random replay minibatches
+            # 5. Learn: replay minibatch updates, target refreshes when due
             # ----------------------------------------------------------
             # Nothing is learned during warm-up (see learning_start_step).
             # After that, gradient_steps minibatches per cycle. The learner
-            # owns everything inside an update: targets, losses, optimizer
-            # steps, delayed actor updates, soft target-network updates.
+            # owns everything inside an update: Bellman targets, losses,
+            # optimizer steps and delayed actor updates. The trainer owns
+            # when the target networks are refreshed (5c below).
             if progress.global_step >= learning_start_step:
                 for _ in range(cfg.gradient_steps):
-                    # batch_size random transitions; every field has leading
-                    # dimension B = cfg.batch_size.
+                    # 5a. Sample batch_size random transitions (every field
+                    #     has leading dimension B = cfg.batch_size) and let
+                    #     the learner update on them. progress still holds
+                    #     the counts from before this update.
                     batch = replay_buffer.sample(cfg.batch_size)
                     training_stats = learner.update(batch, progress=progress)
 
-                    # One minibatch is one update: 1 if the learner used it,
-                    # 0 if it skipped it. This keeps gradient_step meaning
-                    # the same thing for every algorithm.
+                    # 5b. Count it. One minibatch is one update: 1 if the
+                    #     learner used it, 0 if it skipped it. This keeps
+                    #     gradient_step meaning the same thing for every
+                    #     algorithm, and the target schedule depends on it.
                     if (
                         type(training_stats.gradient_steps) is not int
                         or training_stats.gradient_steps not in (0, 1)
@@ -747,12 +799,30 @@ def train_off_policy(
                         progress,
                         gradient_step=progress.gradient_step + training_stats.gradient_steps,
                     )
+
+                    # 5c. Refresh the target networks when this update brings
+                    #     the count to a multiple of target_update_interval.
+                    #     Why also check gradient_steps == 1: a skipped update
+                    #     leaves the count unchanged, so if it already sat on
+                    #     a multiple, the modulo test alone would refresh a
+                    #     second time for the same count. A refresh only
+                    #     copies or blends weights, so no_grad makes sure no
+                    #     gradient graph is recorded, whichever learner
+                    #     implements it.
+                    if (
+                        training_stats.gradient_steps == 1
+                        and progress.gradient_step % cfg.target_update_interval == 0
+                    ):
+                        with torch.no_grad():
+                            learner.update_targets()
+
+                    # 5d. Log this update's losses and diagnostics.
                     logger.log_update(training_stats, progress=progress)
 
             # ----------------------------------------------------------
             # 6. Record: count the cycle, log, evaluate if due
             # ----------------------------------------------------------
-            # One more completed cycle (collection plus learning).
+            # One more completed cycle, including cycles with no learning.
             progress = replace(progress, update=progress.update + 1)
 
             # Pass the new counters to the logger even when warm-up skipped
