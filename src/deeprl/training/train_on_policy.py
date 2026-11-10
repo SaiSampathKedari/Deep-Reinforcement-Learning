@@ -30,6 +30,25 @@ Who does what
 * The caller owns the environments, the networks and, optionally, the
   logger; this trainer never closes what it did not create.
 
+Environments
+------------
+The trainer accepts N batched environments that return torch tensors and
+follow the Gymnasium vector API (``metadata``, ``num_envs``,
+``single_action_space``, ``reset()``, ``step()``). They differ only in who
+restarts a finished episode:
+
+* **Gymnasium tasks** (CartPole, MuJoCo, ...): create them with
+  ``make_vec_env``. They run in ``AutoresetMode.DISABLED``, so the collector
+  restarts finished episodes itself, after storing their true last states.
+* **Batched GPU simulators** such as Isaac Lab: they restart finished episodes
+  inside ``step()`` (``AutoresetMode.SAME_STEP``) and must report the true last
+  states in ``info["final_obs"]`` (Isaac Lab: ``env_cfg.compute_final_obs =
+  True``). They do not have to inherit ``VectorEnv``.
+
+Either way the rollout buffer receives exactly the same transitions, so the
+learners need no changes. ``collectors.py`` explains why the true last state
+matters.
+
 The parallel file
 -----------------
 ``train_off_policy.py`` has the same numbered steps 0-9. Where they differ::
@@ -54,7 +73,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from gymnasium.vector import AutoresetMode, VectorEnv
+from gymnasium.vector import VectorEnv
 
 from deeprl.algorithms.on_policy import OnPolicyLearner
 from deeprl.buffers import RolloutBuffer
@@ -66,7 +85,7 @@ from deeprl.checkpoint import (
     validate_checkpoint_algorithm,
     validate_training_checkpoint,
 )
-from deeprl.collectors import collect_rollout
+from deeprl.collectors import collect_rollout, supported_autoreset_mode
 from deeprl.data_spec import DataSpec
 from deeprl.env import to_tensor_data
 from deeprl.inference import InferencePolicy
@@ -106,11 +125,14 @@ def _validate_setup(
     cfg = learner.cfg
     num_envs = envs.num_envs
 
-    # 1. The environments must not reset themselves. collect_rollout stores
-    #    the true final observation of each episode and then resets that
-    #    environment itself; it relies on nothing resetting behind its back.
-    if envs.metadata.get("autoreset_mode") is not AutoresetMode.DISABLED:
-        raise ValueError("train_on_policy requires AutoresetMode.DISABLED")
+    # 1. The collector must know when the environments restart finished
+    #    episodes, because that decides where the true final observation
+    #    comes from. DISABLED (the collector restarts them) and SAME_STEP
+    #    (the environment already did, and reports the final observations)
+    #    are supported. NEXT_STEP is refused: it would store a fake
+    #    transition at every episode end. Checked here so a wrong setup fails
+    #    before any reset.
+    supported_autoreset_mode(envs, caller="train_on_policy")
 
     # 2. A logger from the caller must track the same N environments, and a
     #    new run needs a fresh one. A used logger would continue the step
@@ -438,8 +460,13 @@ def train_on_policy(
         ``checkpoint_interval`` updates. An interrupted update is not saved.
 
     Args:
-        envs: N vectorized environments returning tensors, created with
-            ``AutoresetMode.DISABLED`` (for example by ``make_vec_env``).
+        envs: N batched environments returning torch tensors, in
+            ``DISABLED`` or ``SAME_STEP`` reset mode (see "Environments" in
+            the module docstring). Gymnasium tasks: ``make_vec_env``. Batched
+            simulators such as Isaac Lab must report ``info["final_obs"]``
+            (``compute_final_obs=True``). The object needs ``metadata``,
+            ``num_envs``, ``single_action_space``, ``reset()`` and
+            ``step()``; it does not have to inherit ``VectorEnv``.
         learner: The algorithm (``PPOLearner``, ``A2CLearner``, ...), already
             built with its networks and processors.
         writer: TensorBoard writer for the internal logger. Ignored when

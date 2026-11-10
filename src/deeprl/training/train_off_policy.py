@@ -62,6 +62,25 @@ Who does what
   optionally, the logger. The trainer creates the replay buffer and, when
   needed, a logger; it never closes objects supplied by the caller.
 
+Environments
+------------
+The trainer accepts N batched environments that return torch tensors and
+follow the Gymnasium vector API (``metadata``, ``num_envs``,
+``single_action_space``, ``reset()``, ``step()``). They differ only in who
+restarts a finished episode:
+
+* **Gymnasium tasks** (CartPole, MuJoCo, ...): create them with
+  ``make_vec_env``. They run in ``AutoresetMode.DISABLED``, so the collector
+  restarts finished episodes itself, after storing their true last states.
+* **Batched GPU simulators** such as Isaac Lab: they restart finished episodes
+  inside ``step()`` (``AutoresetMode.SAME_STEP``) and must report the true last
+  states in ``info["final_obs"]`` (Isaac Lab: ``env_cfg.compute_final_obs =
+  True``). They do not have to inherit ``VectorEnv``.
+
+Either way the replay buffer receives exactly the same transitions, so the
+learners need no changes. ``collectors.py`` explains why the true last state
+matters.
+
 The parallel file
 -----------------
 ``train_on_policy.py`` has the same numbered steps 0-9. Where they differ::
@@ -88,7 +107,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
-from gymnasium.vector import AutoresetMode, VectorEnv, VectorWrapper
+from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv, VectorEnv, VectorWrapper
 from gymnasium.wrappers.vector import NumpyToTorch
 
 from deeprl.algorithms.off_policy import OffPolicyLearner
@@ -101,7 +120,7 @@ from deeprl.checkpoint import (
     validate_checkpoint_algorithm,
     validate_training_checkpoint,
 )
-from deeprl.collectors import collect_transitions
+from deeprl.collectors import collect_transitions, supported_autoreset_mode
 from deeprl.data_spec import DataSpec, TensorData
 from deeprl.env import to_tensor_data
 from deeprl.inference import InferencePolicy
@@ -137,25 +156,34 @@ def _validate_setup(
 
     Raises:
         ValueError: If a setting does not fit.
-        TypeError: If the environment wrapper chain has no ``NumpyToTorch``.
+        TypeError: If a Gymnasium Sync/Async vector env lacks ``NumpyToTorch``.
     """
     cfg = learner.cfg
     num_envs = envs.num_envs
 
-    # 1. The environments must not reset themselves. collect_transitions
-    #    stores the true final observation of each episode and then resets
-    #    that environment itself; it relies on nothing resetting behind its
-    #    back.
-    if envs.metadata.get("autoreset_mode") is not AutoresetMode.DISABLED:
-        raise ValueError("train_off_policy requires AutoresetMode.DISABLED")
+    # 1. The collector must know when the environments restart finished
+    #    episodes, because that decides where the true final observation
+    #    comes from. DISABLED (the collector restarts them) and SAME_STEP
+    #    (the environment already did, and reports the final observations)
+    #    are supported. NEXT_STEP is refused: it would store a fake
+    #    transition at every episode end. Checked here so a wrong setup fails
+    #    before any reset.
+    supported_autoreset_mode(envs, caller="train_off_policy")
 
-    # 2. The environments must return tensors, which the replay buffer
-    #    stores. Walk down the wrapper chain looking for NumpyToTorch.
-    wrapped = envs
-    while isinstance(wrapped, VectorWrapper) and not isinstance(wrapped, NumpyToTorch):
-        wrapped = wrapped.env
-    if not isinstance(wrapped, NumpyToTorch):
-        raise TypeError("train_off_policy requires a NumpyToTorch vector wrapper")
+    # 2. The replay buffer stores tensors. Gymnasium's own Sync/AsyncVectorEnv
+    #    return NumPy arrays, so they must be wrapped in NumpyToTorch
+    #    (make_vec_env does this). Walk down the wrapper chain now, before any
+    #    reset. Other environments (Isaac Lab, torch-native vector envs)
+    #    return tensors themselves; the collector checks their outputs on the
+    #    first step.
+    if isinstance(envs, VectorEnv) and isinstance(
+        envs.unwrapped, (SyncVectorEnv, AsyncVectorEnv)
+    ):
+        wrapped = envs
+        while isinstance(wrapped, VectorWrapper) and not isinstance(wrapped, NumpyToTorch):
+            wrapped = wrapped.env
+        if not isinstance(wrapped, NumpyToTorch):
+            raise TypeError("train_off_policy requires a NumpyToTorch vector wrapper")
 
     # 3. A logger from the caller must track the same N environments, and a
     #    new run needs a fresh one. A used logger would continue the step
@@ -541,9 +569,14 @@ def train_off_policy(
         ``checkpoint_dir``. An interrupted cycle is not saved.
 
     Args:
-        envs: N vectorized environments wrapped in ``NumpyToTorch`` and
-            created with ``AutoresetMode.DISABLED`` (for example by
-            ``make_vec_env``).
+        envs: N batched environments returning torch tensors, in
+            ``DISABLED`` or ``SAME_STEP`` reset mode (see "Environments" in
+            the module docstring). Gymnasium tasks: ``make_vec_env``
+            (``DISABLED`` and ``NumpyToTorch``). Batched simulators such as
+            Isaac Lab must report ``info["final_obs"]``
+            (``compute_final_obs=True``). The object needs ``metadata``,
+            ``num_envs``, ``single_action_space``, ``reset()`` and
+            ``step()``; it does not have to inherit ``VectorEnv``.
         learner: The algorithm, already built with its networks.
         behaviour_policy: The exploring policy used for collection (see
             above).
@@ -580,7 +613,7 @@ def train_off_policy(
     Raises:
         ValueError: If the setup or the checkpoint does not fit this run, or
             the learner reports an invalid gradient step count.
-        TypeError: If the environment wrapper chain has no ``NumpyToTorch``.
+        TypeError: If a Gymnasium Sync/Async vector env lacks ``NumpyToTorch``.
     """
     # ------------------------------------------------------------------
     # 0. Validate the run
@@ -739,10 +772,13 @@ def train_off_policy(
                     )
 
                 # Act with the behaviour policy (it explores), step all N
-                # environments, store N transitions in replay, and reset the
-                # finished episodes. global_step tells exploration schedules
-                # how far training is. Returns the next observations, and
-                # rewards and episode ends shaped (1, N).
+                # environments and store N transitions in replay. Episodes
+                # that ended are restarted by the collector (DISABLED) or
+                # were already restarted by the environment (SAME_STEP);
+                # either way replay receives their true last states.
+                # global_step tells exploration schedules how far training
+                # is. Returns the next observations, and rewards and episode
+                # ends shaped (1, N).
                 observations, rewards, dones = collect_transitions(
                     envs=envs,
                     behaviour_policy=behaviour_policy,

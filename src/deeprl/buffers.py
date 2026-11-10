@@ -48,14 +48,17 @@ def _allocate_storage(
     return batch[0].to(device).expand(*leading_shape).apply(torch.zeros_like)
 
 
-def _validate_batch(
+def validate_batch(
     batch       : TensorData,
     *,
     batch_size  : int,
     name        : str,
     reference   : TensorData | None = None,
 ) -> None:
-    """Check the batch axis and preserve the first insertion's leaf schema."""
+    """Check the batch axis and preserve the first insertion's leaf schema.
+
+    Collectors also use this to check SAME_STEP final observations before storage.
+    """
     # Lazy stacks can hide keys that are not shared by every item.
     if isinstance(batch, LazyStackedTensorDict):
         raise TypeError(f"{name} must use a homogeneous dense TensorDict, not a lazy stack")
@@ -89,7 +92,7 @@ def _validate_batch(
     if isinstance(reference, TensorDictBase) and set(batch.keys()) != set(reference.keys()):
         raise ValueError(f"{name} must keep the same TensorDict keys")
     for key, value in batch.items():
-        _validate_batch(
+        validate_batch(
             value,
             batch_size=batch_size,
             name=f"{name}.{key}",
@@ -188,7 +191,7 @@ class RolloutBuffer:
             ("action", action, self.actions),
             ("next_observation", next_observation, self.next_observations),
         ):
-            _validate_batch(
+            validate_batch(
                 batch,
                 batch_size=N,
                 name=name,
@@ -422,7 +425,7 @@ class ReplayBuffer:
             ("action", action, self.actions),
             ("next_observation", next_observation, self.next_observations),
         ):
-            _validate_batch(
+            validate_batch(
                 batch,
                 batch_size=num_transitions,
                 name=name,
